@@ -42,7 +42,7 @@ from mtl_loss_schemes import MultiTaskLoss, get_loss
 from evaluation.evaluate_utils import PerformanceMeter, get_output
 from evaluation.eval_edge import eval_edge_predictions
 from ptflops import get_model_complexity_info
-from models.lora import mark_only_lora_as_trainable
+from models.lora import mark_only_lora_as_trainable, mark_prompt_as_trainable
 
 try:
     import wandb
@@ -264,6 +264,8 @@ def main(config):
                                         freeze_norm=config.TRAIN.FREEZE_LAYER_NORM,
                                         free_relative_bias=config.TRAIN.FREEZE_RELATIVE_POSITION_BIAS,
                                         freeze_downsample_reduction=True if config.MODEL.MTLORA.DOWNSAMPLER_ENABLED else config.TRAIN.FREEZE_DOWNSAMPLE_REDUCTION)
+            if config.MODEL.PROMPT.ENABLED:
+                mark_prompt_as_trainable(model.backbone)
         else:
             print("Marking all layers as trainable")
     if config.MODEL.FREEZE_BACKBONE:

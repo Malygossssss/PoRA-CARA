@@ -201,26 +201,37 @@ class MultiTaskSwin(nn.Module):
         )
 
     def forward(self, x):
-        shared_representation = self.backbone(x, return_stages=True)
-
-        if self.mtlora.ENABLED:
-            shared_ft = {task: [] for task in self.tasks}
-
-            for _, tasks_shared_rep in shared_representation:
-                for task, shared_rep in tasks_shared_rep.items():
-                    shared_ft[task].append(shared_rep)
+        if hasattr(self.backbone, "prompt_config"):
+            shared_ft = {}
             for task in self.tasks:
-                shared_ft[task] = self.downsampler[task](shared_ft[task])
+                features = self.backbone(x, task=task, return_stages=True)
+                downsampler = (
+                    self.downsampler[task]
+                    if isinstance(self.downsampler, nn.ModuleDict)
+                    else self.downsampler
+                )
+                shared_ft[task] = downsampler(features)
         else:
-            if self.per_task_downsampler:
-                shared_ft = {
-                    task: self.downsampler[task](shared_representation)
-                    for task in self.tasks
-                }
+            shared_representation = self.backbone(x, return_stages=True)
+
+            if self.mtlora.ENABLED:
+                shared_ft = {task: [] for task in self.tasks}
+
+                for _, tasks_shared_rep in shared_representation:
+                    for task, shared_rep in tasks_shared_rep.items():
+                        shared_ft[task].append(shared_rep)
+                for task in self.tasks:
+                    shared_ft[task] = self.downsampler[task](shared_ft[task])
             else:
-                shared_representation = self.downsampler(shared_representation)
-                shared_ft = {
-                    task: shared_representation for task in self.tasks}
+                if self.per_task_downsampler:
+                    shared_ft = {
+                        task: self.downsampler[task](shared_representation)
+                        for task in self.tasks
+                    }
+                else:
+                    shared_representation = self.downsampler(shared_representation)
+                    shared_ft = {
+                        task: shared_representation for task in self.tasks}
 
         result = self.decoders(shared_ft)
         return result

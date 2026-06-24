@@ -785,6 +785,12 @@ def mark_only_lora_as_trainable(model: nn.Module, bias: str = "none", freeze_pat
         raise NotImplementedError
 
 
+def mark_prompt_as_trainable(model: nn.Module) -> None:
+    for name, param in model.named_parameters():
+        if "prompt_embeddings" in name or "deep_prompt_embeddings" in name:
+            param.requires_grad = True
+
+
 def lora_filter(key: str, value: Any) -> bool:
     return "lora_" in key
 

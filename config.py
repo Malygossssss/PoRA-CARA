@@ -182,6 +182,17 @@ _C.MODEL.DECODER_CHANNELS = [18, 36, 72, 144]
 
 _C.MODEL.SEGFORMER_CHANNELS = 256
 
+# Minimal visual prompt tuning support for CARA + AG-MTLoRA.
+_C.MODEL.PROMPT = CN()
+_C.MODEL.PROMPT.ENABLED = False
+_C.MODEL.PROMPT.NUM_TOKENS = 0
+_C.MODEL.PROMPT.DEEP = True
+_C.MODEL.PROMPT.LOCATION = 'prepend'
+_C.MODEL.PROMPT.DROPOUT = 0.0
+_C.MODEL.PROMPT.INITIATION = 'random'
+_C.MODEL.PROMPT.DYNAMIC_PROMPT = False
+_C.MODEL.PROMPT.SHARE_TASK_PROMPT = False
+
 # -----------------------------------------------------------------------------
 # Training settings
 # -----------------------------------------------------------------------------
@@ -548,6 +559,22 @@ def update_config(config, args):
 
     # output folder
     config.OUTPUT = os.path.join(config.OUTPUT, config.MODEL.NAME, config.TAG)
+
+    if config.MODEL.PROMPT.ENABLED:
+        if not config.MODEL.MTLORA.ENABLED:
+            raise ValueError("MODEL.PROMPT.ENABLED=True requires MODEL.MTLORA.ENABLED=True.")
+        if str(config.MODEL.PROMPT.LOCATION) != 'prepend':
+            raise ValueError("MODEL.PROMPT.LOCATION must be 'prepend' for CARA prompt support.")
+        if not bool(config.MODEL.PROMPT.DEEP):
+            raise ValueError("MODEL.PROMPT.DEEP must be True for CARA prompt support.")
+        if int(config.MODEL.PROMPT.NUM_TOKENS) <= 0:
+            raise ValueError("MODEL.PROMPT.NUM_TOKENS must be > 0 when MODEL.PROMPT.ENABLED=True.")
+        if str(config.MODEL.PROMPT.INITIATION) != 'random':
+            raise ValueError("MODEL.PROMPT.INITIATION must be 'random' for CARA prompt support.")
+        if bool(config.MODEL.PROMPT.DYNAMIC_PROMPT):
+            raise ValueError("MODEL.PROMPT.DYNAMIC_PROMPT is not supported in CARA's minimal prompt path.")
+        if bool(config.MODEL.PROMPT.SHARE_TASK_PROMPT):
+            raise ValueError("MODEL.PROMPT.SHARE_TASK_PROMPT is not supported in CARA's minimal prompt path.")
 
     # Normalize MTLoRA config
     if config.MODEL.MTLORA.ENABLED:
