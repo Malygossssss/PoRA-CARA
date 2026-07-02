@@ -37,7 +37,7 @@ from data.mtl_ds import (
 )
 from logger import create_logger
 from models import build_model, build_mtl_model
-from models.lora import mark_only_lora_as_trainable
+from models.lora import mark_only_lora_as_trainable, mark_prompt_as_trainable
 from mtl_loss_schemes import MultiTaskLoss, get_loss
 from optimizer import build_optimizer
 from utils import load_checkpoint, load_pretrained, mkdir_if_missing
@@ -684,6 +684,8 @@ def build_task_model(config: CN, device: torch.device, logger, init_state_dict: 
                 True if config.MODEL.MTLORA.DOWNSAMPLER_ENABLED else config.TRAIN.FREEZE_DOWNSAMPLE_REDUCTION
             ),
         )
+        if bool(getattr(getattr(config.MODEL, "PROMPT", None), "ENABLED", False)):
+            mark_prompt_as_trainable(model.backbone)
     return model
 
 

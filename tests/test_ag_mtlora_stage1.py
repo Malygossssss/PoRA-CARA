@@ -6,6 +6,8 @@ from types import SimpleNamespace
 from unittest import mock
 
 import numpy as np
+import torch
+import torch.nn as nn
 import yaml
 from yacs.config import CfgNode as CN
 
@@ -28,6 +30,22 @@ class FakeDataset:
 class DummyResolvedConfig:
     def dump(self):
         return "MODEL:\n  AGMTLORA:\n    ENABLED: true\n"
+
+
+class FakePromptBackbone(nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.prompt_embeddings = nn.Parameter(torch.ones(1))
+        self.deep_prompt_embeddings = nn.Parameter(torch.ones(1))
+        self.lora_shared_A = nn.Parameter(torch.ones(1))
+        self.non_lora_weight = nn.Parameter(torch.ones(1))
+
+
+class FakePromptTaskModel(nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.backbone = FakePromptBackbone()
+        self.decoder = nn.Linear(1, 1)
 
 
 def build_stage1_config(tmpdir, split_mode="train_meta_strict"):
@@ -91,6 +109,53 @@ def build_update_config_args(cfg_path, tmpdir, tasks="task_a,task_b"):
 
 
 class Stage1MetaSplitTest(unittest.TestCase):
+    def test_build_task_model_keeps_prompt_trainable_for_stage1_optimizer(self):
+        config = CN()
+        config.MTL = False
+        config.MODEL = CN()
+        config.MODEL.MTLORA = CN()
+        config.MODEL.MTLORA.ENABLED = True
+        config.MODEL.MTLORA.FREEZE_PRETRAINED = True
+        config.MODEL.MTLORA.BIAS = "none"
+        config.MODEL.MTLORA.DOWNSAMPLER_ENABLED = False
+        config.MODEL.PROMPT = CN()
+        config.MODEL.PROMPT.ENABLED = True
+        config.TRAIN = CN()
+        config.TRAIN.FREEZE_PATCH_EMBED = True
+        config.TRAIN.FREEZE_LAYER_NORM = True
+        config.TRAIN.FREEZE_RELATIVE_POSITION_BIAS = True
+        config.TRAIN.FREEZE_DOWNSAMPLE_REDUCTION = True
+        config.TRAIN.BASE_LR = 1e-4
+        config.TRAIN.WEIGHT_DECAY = 0.05
+        config.TRAIN.OPTIMIZER = CN()
+        config.TRAIN.OPTIMIZER.NAME = "adamw"
+        config.TRAIN.OPTIMIZER.EPS = 1e-8
+        config.TRAIN.OPTIMIZER.BETAS = (0.9, 0.999)
+        config.TRAIN.OPTIMIZER.MOMENTUM = 0.9
+        config.freeze()
+
+        with mock.patch("ag_mtlora.stage1.build_model", return_value=FakePromptTaskModel()), mock.patch(
+            "ag_mtlora.stage1.maybe_load_initial_weights"
+        ):
+            model = stage1.build_task_model(config, torch.device("cpu"), mock.Mock())
+
+        prompt_params = [
+            param
+            for name, param in model.backbone.named_parameters()
+            if "prompt_embeddings" in name or "deep_prompt_embeddings" in name
+        ]
+        self.assertEqual(len(prompt_params), 2)
+        self.assertTrue(all(param.requires_grad for param in prompt_params))
+        self.assertFalse(model.backbone.non_lora_weight.requires_grad)
+
+        optimizer = stage1.build_optimizer(config, model)
+        optimizer_param_ids = {
+            id(param)
+            for group in optimizer.param_groups
+            for param in group["params"]
+        }
+        self.assertTrue(all(id(param) in optimizer_param_ids for param in prompt_params))
+
     def test_parse_predictor_progress_from_log_recovers_singletons_and_groups(self):
         with tempfile.TemporaryDirectory() as tmpdir:
             log_path = os.path.join(tmpdir, "log_rank0.txt")
