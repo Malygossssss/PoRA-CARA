@@ -72,15 +72,13 @@ AGMTLORA:
 
 Stage-1 的目标是只用 shared LoRA 来评估 task affinity，并搜索任务分组。为了避免 prompt 影响 affinity，Stage-1 prepare 命令中临时关闭 prompt：
 
-```powershell
-python scripts\ag_mtlora_stage1_prepare.py `
-  --cfg configs\mtlora\tiny_448\pascal\unipora_cara_tiny_448_r64_prom50_global_group_proxy.yaml `
-  --pascal D:\path\to\PASCAL_MT `
-  --tasks semseg,normals,sal,human_parts `
-  --batch-size 8 `
-  --resume-backbone backbone\swin_tiny_patch4_window7_224.pth `
+python scripts/ag_mtlora_stage1_prepare.py \
+  --cfg configs/mtlora/tiny_448/pascal/unipora_cara_tiny_448_r64_prom50_global_group_proxy.yaml \
+  --pascal PASCAL_MT \
+  --tasks semseg,normals,sal,human_parts \
+  --batch-size 32 \
+  --resume-backbone backbone/Swin/swin_tiny_patch4_window7_224.pth \
   --opts MODEL.PROMPT.ENABLED False
-```
 
 这一步会发生以下事情：
 
@@ -154,6 +152,7 @@ torchrun --nproc_per_node=1 main.py `
   --ckpt-freq 20 `
   --eval-freq 5 `
   --resume output\<MODEL.NAME>\<TAG>\ag_mtlora_stage1_prepare\run_<timestamp>\post_affinity_checkpoint.pth
+  --skip_initial_validation
 ```
 
 推荐使用 `--resume post_affinity_checkpoint.pth`，原因是：
