@@ -19,9 +19,10 @@ import json
 import random
 import argparse
 import datetime
+import math
 import shutil
-from contextlib import nullcontext
 import numpy as np
+import matplotlib.pyplot as plt
 
 import torch
 import torch.backends.cudnn as cudnn
@@ -39,6 +40,11 @@ from logger import create_logger
 from utils import load_checkpoint, load_pretrained, save_checkpoint, NativeScalerWithGradNormCount, auto_resume_helper
 
 from mtl_loss_schemes import MultiTaskLoss, get_loss
+from constrained_mtl import (
+    ConstrainedMTLController,
+    maybe_load_controller_state,
+    validate_warmup_resume_state,
+)
 from evaluation.evaluate_utils import PerformanceMeter, get_output
 from evaluation.eval_edge import eval_edge_predictions
 from ptflops import get_model_complexity_info
@@ -158,6 +164,7 @@ def main(config):
         config)
 
     logger.info(f"Creating model:{config.MODEL.TYPE}/{config.MODEL.NAME}")
+    teacher = None
     model = build_model(config)
     if config.MTL:
         model = build_mtl_model(model, config)
@@ -174,6 +181,8 @@ def main(config):
                                              print_per_layer_stat=False, verbose=False)
 
     logger.info(f"ptflops GMACS = {macs} and params = {params}")
+
+    model_without_ddp = model
 
     optimizer = build_optimizer(config, model)
 
@@ -212,7 +221,27 @@ def main(config):
 
         criterion = MultiTaskLoss(config.TASKS, loss_ft, loss_weights)
 
+    constraint_controller = None
+    if config.MTL:
+        constraint_controller = ConstrainedMTLController(
+            config, config.TASKS, logger=logger)
+        if config.TRAIN.CONSTRAINED_MTL.ENABLED:
+            if constraint_controller.active:
+                logger.info(
+                    "Constrained MTL enabled with protected tasks %s (objective=%s, ref_mode=%s, warmup_epochs=%d)",
+                    constraint_controller.protected_tasks,
+                    constraint_controller.objective_mode,
+                    constraint_controller.ref_mode,
+                    constraint_controller.warmup_epochs,
+                )
+            else:
+                logger.info(
+                    "Constrained MTL requested but no protected tasks are active; training will use the baseline weighted-sum loss."
+                )
+
     max_accuracy = 0.0
+    resume_extra_state = {}
+    resume_load_info = {}
 
     if config.TRAIN.AUTO_RESUME:
         resume_file = auto_resume_helper(config.OUTPUT)
@@ -229,7 +258,21 @@ def main(config):
                 f'no checkpoint found in {config.OUTPUT}, ignoring auto resume')
     if config.MODEL.RESUME:
         max_accuracy = load_checkpoint(
-            config, model, optimizer, lr_scheduler, loss_scaler, logger)
+            config, model_without_ddp, optimizer, lr_scheduler, loss_scaler, logger,
+            extra_state=resume_extra_state, load_info=resume_load_info)
+        if constraint_controller is not None:
+            controller_state = resume_extra_state.get("constrained_mtl")
+            validate_warmup_resume_state(
+                constraint_controller,
+                isinstance(controller_state, dict),
+                resume_load_info.get("restored_train_state", False),
+                config.TRAIN.START_EPOCH,
+            )
+            maybe_load_controller_state(
+                constraint_controller,
+                controller_state,
+                resume_load_info.get("restored_train_state", False),
+            )
 
         if not config.SKIP_INITIAL_EVAL:
             validate(config, data_loader_val, model, 0)
@@ -238,7 +281,7 @@ def main(config):
 
     if config.MODEL.RESUME_BACKBONE:
         max_accuracy = load_checkpoint(
-            config, model.backbone, optimizer, lr_scheduler, loss_scaler, logger, True)
+            config, model_without_ddp.backbone, optimizer, lr_scheduler, loss_scaler, logger, True)
         if config.EVAL_MODE:
             validate(config, data_loader_val, model, 0)
             return
@@ -247,8 +290,13 @@ def main(config):
         validate(config, data_loader_val, model, 0)
         return
 
+    if teacher is not None:
+        print("loading teacher.......")
+        load_checkpoint(config, teacher, optimizer, lr_scheduler,
+                        loss_scaler, logger, quiet=True)
+
     if config.MODEL.PRETRAINED and (not config.MODEL.RESUME):
-        load_pretrained(config, model, logger)
+        load_pretrained(config, model_without_ddp, logger)
         if not config.SKIP_INITIAL_EVAL:
             acc1, _, _ = validate(config, data_loader_val, model, 0)
 
@@ -289,37 +337,70 @@ def main(config):
         f"Total params:               {total_model_params:,} (trainable ratio: {trainable_params/total_model_params * 100:2.2f}%)\n"
         f"Total params without LoRA:  {total_model_params_without_lora:,} (trainable ratio: {trainable_params/total_model_params_without_lora * 100:2.2f}%)"
     )
-    # --- DDP wrapping (after all model setup) ---
-    model_without_ddp = model
-    if dist.get_world_size() > 1:
-        model = torch.nn.parallel.DistributedDataParallel(
-            model,
-            device_ids=[config.LOCAL_RANK],
-            broadcast_buffers=False,
-            find_unused_parameters=True,
-        )
-        model_without_ddp = model.module
-
     logger.info("Start training")
     start_time = time.perf_counter()
 
+    record_cr_values = config.TRAIN.ENABLE_CONFLICT_RATIO and dist.get_rank() == 0
+    all_batch_cr_records = [] if record_cr_values else None
+    total_cr_sum = 0.0
+    total_cr_count = 0.0
+
     epoch = config.TRAIN.START_EPOCH
     for epoch in range(config.TRAIN.START_EPOCH, config.TRAIN.EPOCHS):
-        if hasattr(data_loader_train.sampler, 'set_epoch'):
+        if not config.MTL:
             data_loader_train.sampler.set_epoch(epoch)
 
-        train_one_epoch(config, model, criterion, data_loader_train,
-                        optimizer, epoch, mixup_fn, lr_scheduler,
-                        loss_scaler)
+        epoch_cr_records, epoch_cr_sum, epoch_cr_count = train_one_epoch(config, model, criterion, data_loader_train,
+                                                                         optimizer, epoch, mixup_fn, lr_scheduler,
+                                                                         loss_scaler, teacher=teacher,
+                                                                         constraint_controller=constraint_controller)
+        constraint_epoch_summary = None
+        if constraint_controller is not None:
+            constraint_epoch_summary = constraint_controller.on_epoch_end(epoch)
+            if constraint_epoch_summary is not None:
+                constraint_summary_text = constraint_controller.format_epoch_summary(
+                    constraint_epoch_summary)
+                if constraint_summary_text:
+                    logger.info(f"ConstrainedMTL Epoch: {constraint_summary_text}")
+                if wandb_available:
+                    wandb.log(_flatten_constrained_epoch_metrics(
+                        constraint_epoch_summary, epoch))
+        if config.TRAIN.ENABLE_CONFLICT_RATIO:
+            total_cr_sum += epoch_cr_sum
+            total_cr_count += epoch_cr_count
+            if record_cr_values and epoch_cr_records:
+                all_batch_cr_records.extend(epoch_cr_records)
         if dist.get_rank() == 0 and (epoch % config.SAVE_FREQ == 0 or epoch == (config.TRAIN.EPOCHS - 1)):
             save_checkpoint(config, epoch, model_without_ddp, max_accuracy, optimizer, lr_scheduler, loss_scaler,
-                            logger)
+                            logger,
+                            extra_state={'constrained_mtl': constraint_controller.state_dict()} if constraint_controller is not None else None)
         if epoch % config.EVAL_FREQ == 0 or (not args.no_eval_50 and epoch == 50):
             if config.MTL:
                 validate(config, data_loader_val, model, epoch)
             else:
                 acc1, _, _ = validate(config, data_loader_val, model, epoch)
                 max_accuracy = max(max_accuracy, acc1)
+
+    if config.TRAIN.ENABLE_CONFLICT_RATIO:
+        cr_device = next(model.parameters()).device
+        cr_tensor = torch.tensor([total_cr_sum, total_cr_count], dtype=torch.float64, device=cr_device)
+        if dist.is_initialized():
+            dist.all_reduce(cr_tensor, op=dist.ReduceOp.SUM)
+        total_count_value = cr_tensor[1].item()
+        global_avg_cr = (cr_tensor[0] / total_count_value).item() if total_count_value > 0 else 0.0
+        if dist.get_rank() == 0:
+            os.makedirs(config.OUTPUT, exist_ok=True)
+            cr_output_path = os.path.join(config.OUTPUT, "conflict_ratio.txt")
+            with open(cr_output_path, "w") as f:
+                if all_batch_cr_records:
+                    for record in all_batch_cr_records:
+                        f.write(
+                            f"epoch={record['epoch']}, batch={record['batch']}, global_step={record['global_step']}, cr={record['cr']:.6f}\n"
+                        )
+                else:
+                    f.write("# No conflict ratio values were recorded.\n")
+                f.write(f"global_average_cr: {global_avg_cr:.6f}\n")
+            logger.info(f"Conflict gradient ratio metrics saved to {cr_output_path}")
 
     # final eval
     validate(config, data_loader_val, model, epoch)
@@ -332,6 +413,59 @@ def _get_dist_rank():
     if dist.is_available() and dist.is_initialized():
         return dist.get_rank()
     return 0
+
+
+def _flatten_constrained_step_metrics(step_metrics):
+    if not step_metrics:
+        return {}
+
+    metrics = {
+        "train/constrained/alm_rho": step_metrics["alm_rho"],
+        "train/constrained/ref_loss_frozen": float(bool(step_metrics["ref_loss"])),
+    }
+    if step_metrics["objective_loss"] is not None:
+        metrics["train/constrained/objective_loss"] = step_metrics["objective_loss"]
+    metrics["train/constrained/constrained_total_loss"] = step_metrics["constrained_total_loss"]
+
+    for task, value in step_metrics["ref_loss"].items():
+        metrics[f"train/constrained/ref_loss/{task}"] = value
+    for task, value in step_metrics["norm_loss"].items():
+        metrics[f"train/constrained/norm_loss/{task}"] = value
+    for task, value in step_metrics["violation"].items():
+        metrics[f"train/constrained/violation/{task}"] = value
+    for task, value in step_metrics["pos_violation"].items():
+        metrics[f"train/constrained/pos_violation/{task}"] = value
+    for task, value in step_metrics["lambda"].items():
+        metrics[f"train/constrained/lambda/{task}"] = value
+    for task, value in step_metrics["constraint_satisfied"].items():
+        metrics[f"train/constrained/constraint_satisfied/{task}"] = value
+
+    return metrics
+
+
+def _flatten_constrained_epoch_metrics(epoch_summary, epoch):
+    if not epoch_summary:
+        return {}
+
+    metrics = {
+        "train/constrained_epoch/epoch": epoch,
+        "train/constrained_epoch/alm_rho": epoch_summary["alm_rho"],
+        "train/constrained_epoch/ref_loss_frozen": float(epoch_summary["ref_loss_frozen"]),
+    }
+    if epoch_summary.get("ref_loss_frozen_epoch") is not None:
+        metrics["train/constrained_epoch/ref_loss_frozen_epoch"] = float(
+            epoch_summary["ref_loss_frozen_epoch"])
+
+    for task, value in epoch_summary.get("ref_loss", {}).items():
+        metrics[f"train/constrained_epoch/ref_loss/{task}"] = value
+    for task, value in epoch_summary.get("epoch_avg_violation", {}).items():
+        metrics[f"train/constrained_epoch/epoch_avg_violation/{task}"] = value
+    for task, value in epoch_summary.get("epoch_avg_pos_violation", {}).items():
+        metrics[f"train/constrained_epoch/epoch_avg_pos_violation/{task}"] = value
+    for task, value in epoch_summary.get("lambda_after_update", {}).items():
+        metrics[f"train/constrained_epoch/lambda_after_update/{task}"] = value
+
+    return metrics
 
 
 def _prepare_edge_eval_cache(output_dir, epoch):
@@ -355,7 +489,108 @@ def _save_edge_predictions(cache_dir, image_ids, edge_logits):
             edge_probs[index, 0].astype(np.float32),
         )
 
-def train_one_epoch(config, model, criterion, data_loader, optimizer, epoch, mixup_fn, lr_scheduler, loss_scaler):
+
+def _is_per_task_parameter(name, tasks):
+    for task in tasks:
+        if f".{task}." in name or name.endswith(f".{task}") or f".{task}_" in name or f"_{task}." in name:
+            return True
+    return False
+
+
+def _get_shared_parameters_for_cr(model, config):
+    tasks = set(config.TASKS) if hasattr(config, "TASKS") else set()
+    shared_params = []
+    for name, param in model.named_parameters():
+        if not param.requires_grad:
+            continue
+        if name.startswith("decoders."):
+            continue
+        if name.startswith("downsampler."):
+            parts = name.split(".")
+            if len(parts) > 1 and parts[1] in tasks:
+                continue
+        if tasks and _is_per_task_parameter(name, tasks):
+            continue
+        shared_params.append(param)
+    return shared_params
+
+
+def _compute_conflict_ratio(loss_dict, shared_params, task_order, task_weights):
+    if loss_dict is None or not shared_params:
+        return 0.0
+
+    active_tasks = [task for task in task_order if task in loss_dict]
+    if not active_tasks:
+        return 0.0
+
+    task_losses = {
+        task: loss_dict[task] * float(task_weights.get(task, 1.0))
+        for task in active_tasks
+    }
+
+    if not task_losses:
+        return 0.0
+
+    # Accumulate total gradient across tasks and per-task norms
+    sum_total = [torch.zeros_like(param, dtype=torch.float32) for param in shared_params]
+    task_norm_sq = {task: 0.0 for task in task_losses}
+
+    for task, loss_value in task_losses.items():
+        grads = torch.autograd.grad(loss_value, shared_params, retain_graph=True, allow_unused=True)
+        norm_sq = 0.0
+        for idx, (grad, accum) in enumerate(zip(grads, sum_total)):
+            if grad is None:
+                continue
+            grad_detached = grad.detach()
+            if grad_detached.dtype != torch.float32:
+                grad_detached = grad_detached.float()
+            accum.add_(grad_detached)
+            norm_sq += torch.sum(grad_detached * grad_detached).item()
+        task_norm_sq[task] = norm_sq
+
+    sum_total_norm_sq = 0.0
+    for accum in sum_total:
+        sum_total_norm_sq += torch.sum(accum * accum).item()
+
+    task_dot_with_sum = {}
+    for task, loss_value in task_losses.items():
+        grads = torch.autograd.grad(loss_value, shared_params, retain_graph=True, allow_unused=True)
+        dot_val = 0.0
+        for grad, accum in zip(grads, sum_total):
+            if grad is None:
+                continue
+            grad_detached = grad.detach()
+            if grad_detached.dtype != torch.float32:
+                grad_detached = grad_detached.float()
+            dot_val += torch.sum(grad_detached * accum).item()
+        task_dot_with_sum[task] = dot_val
+
+    eps = 1e-12
+    ratios = []
+    for task in task_losses:
+        grad_norm_sq = task_norm_sq.get(task, 0.0)
+        if grad_norm_sq <= eps:
+            ratios.append(0.0)
+            continue
+        dot_val = task_dot_with_sum.get(task, 0.0) - grad_norm_sq
+        other_norm_sq = sum_total_norm_sq - grad_norm_sq - 2.0 * dot_val
+        if other_norm_sq <= eps:
+            ratios.append(0.0)
+            continue
+        proj_norm_sq = (dot_val ** 2) / (other_norm_sq + eps)
+        conflict_norm_sq = grad_norm_sq - proj_norm_sq
+        if conflict_norm_sq < 0.0:
+            conflict_norm_sq = 0.0
+        ratio = math.sqrt(conflict_norm_sq / (grad_norm_sq + eps))
+        ratios.append(ratio)
+
+    if not ratios:
+        return 0.0
+
+    return float(sum(ratios) / len(ratios))
+
+
+def train_one_epoch(config, model, criterion, data_loader, optimizer, epoch, mixup_fn, lr_scheduler, loss_scaler, task=None, teacher=None, constraint_controller=None):
     model.train()
     optimizer.zero_grad()
 
@@ -371,7 +606,43 @@ def train_one_epoch(config, model, criterion, data_loader, optimizer, epoch, mix
     end = time.perf_counter()
     loss_dict = None
 
+    compute_cr = bool(config.MTL and config.TRAIN.ENABLE_CONFLICT_RATIO and hasattr(criterion, 'loss_weights'))
+    shared_params_for_cr = None
+    task_order_for_cr = list(config.TASKS) if compute_cr else []
+    task_weights_for_cr = {}
+    cr_records = [] if compute_cr and dist.get_rank() == 0 else None
+    cr_period = 1
+    if compute_cr:
+        period_value = getattr(config.TRAIN, 'CONFLICT_RATIO_PERIOD', 1)
+        try:
+            cr_period = int(period_value)
+        except (TypeError, ValueError):
+            cr_period = 1
+        if cr_period < 1:
+            cr_period = 1
+    cr_sum = 0.0
+    cr_count = 0.0
+
+    if compute_cr:
+        shared_params_for_cr = _get_shared_parameters_for_cr(model, config)
+        if not shared_params_for_cr:
+            compute_cr = False
+            if dist.get_rank() == 0:
+                logger.warning("Conflict ratio computation disabled because no shared parameters were found.")
+        else:
+            task_weights_for_cr = {
+                task: float(criterion.loss_weights.get(task, 1.0))
+                for task in task_order_for_cr if task in criterion.loss_weights
+            }
+            if not task_weights_for_cr:
+                compute_cr = False
+                if dist.get_rank() == 0:
+                    logger.warning("Conflict ratio computation disabled because no task weights were available.")
+            elif cr_records is not None:
+                cr_records = []
+
     for idx, batch in enumerate(data_loader):
+        global_step = epoch * num_steps + idx + 1
         if not config.MTL:
             samples, targets = batch
             samples = samples.cuda(non_blocking=True)
@@ -383,77 +654,91 @@ def train_one_epoch(config, model, criterion, data_loader, optimizer, epoch, mix
 
         if mixup_fn is not None:
             samples, targets = mixup_fn(samples, targets)
+        with torch.cuda.amp.autocast(enabled=config.AMP_ENABLE):
+            outputs = model(samples)
+            loss, loss_dict = criterion(outputs, targets)
+        constraint_metrics = None
+        if constraint_controller is not None:
+            loss, constraint_metrics = constraint_controller.compute_loss(
+                loss_dict, loss, epoch, samples.size(0))
 
-        # Skip gradient sync on intermediate accumulation steps for DDP efficiency
-        is_accumulating = (idx + 1) % config.TRAIN.ACCUMULATION_STEPS != 0
-        sync_ctx = model.no_sync if (hasattr(model, 'no_sync') and is_accumulating) else nullcontext
+        if config.DEBUG_REPRO_STEPS > 0 and idx < config.DEBUG_REPRO_STEPS and dist.get_rank() == 0:
+            sample_mean = float(samples.mean().item())
+            sample_std = float(samples.std().item())
 
-        with sync_ctx():
-            with torch.cuda.amp.autocast(enabled=config.AMP_ENABLE):
-                outputs = model(samples)
-                loss, loss_dict = criterion(outputs, targets)
-
-            if config.DEBUG_REPRO_STEPS > 0 and idx < config.DEBUG_REPRO_STEPS and dist.get_rank() == 0:
-                sample_mean = float(samples.mean().item())
-                sample_std = float(samples.std().item())
-
-                batch_ids = []
-                if isinstance(batch, dict) and 'meta' in batch and isinstance(batch['meta'], dict) and 'image' in batch['meta']:
-                    ids = batch['meta']['image']
-                    if isinstance(ids, (list, tuple)):
-                        batch_ids = [str(x) for x in ids[:4]]
-                    else:
-                        batch_ids = [str(ids)]
-
-                target_stats = []
-                if isinstance(targets, dict):
-                    for task_name, task_tensor in targets.items():
-                        task_tensor_f = task_tensor.float()
-                        stat = f"{task_name}:mean={float(task_tensor_f.mean().item()):.6f},std={float(task_tensor_f.std().item()):.6f}"
-                        if task_tensor.dim() >= 3:
-                            labels = task_tensor.long().view(-1)
-                            valid = labels != 255
-                            valid_ratio = float(valid.float().mean().item())
-                            stat += f",valid_ratio={valid_ratio:.6f}"
-                            if task_name in {'semseg', 'human_parts'} and valid.any():
-                                valid_labels = labels[valid]
-                                uniq, counts = torch.unique(valid_labels, return_counts=True)
-                                topk = min(3, uniq.numel())
-                                if topk > 0:
-                                    order = torch.argsort(counts, descending=True)[:topk]
-                                    top_items = [f"{int(uniq[i])}:{int(counts[i])}" for i in order]
-                                    stat += f",top_labels={','.join(top_items)}"
-                        target_stats.append(stat)
+            batch_ids = []
+            if isinstance(batch, dict) and 'meta' in batch and isinstance(batch['meta'], dict) and 'image' in batch['meta']:
+                ids = batch['meta']['image']
+                if isinstance(ids, (list, tuple)):
+                    batch_ids = [str(x) for x in ids[:4]]
                 else:
-                    target_tensor = targets.float()
-                    target_stats.append(f"cls:mean={float(target_tensor.mean().item()):.6f},std={float(target_tensor.std().item()):.6f}")
+                    batch_ids = [str(ids)]
 
-                output_stats = []
-                if isinstance(outputs, dict):
-                    for task_name, out in outputs.items():
-                        out = out.float()
-                        output_stats.append(f"{task_name}:mean={float(out.mean().item()):.6f},std={float(out.std().item()):.6f}")
-                else:
-                    out = outputs.float()
-                    output_stats.append(f"cls:mean={float(out.mean().item()):.6f},std={float(out.std().item()):.6f}")
+            target_stats = []
+            if isinstance(targets, dict):
+                for task_name, task_tensor in targets.items():
+                    task_tensor_f = task_tensor.float()
+                    stat = f"{task_name}:mean={float(task_tensor_f.mean().item()):.6f},std={float(task_tensor_f.std().item()):.6f}"
+                    if task_tensor.dim() >= 3:
+                        labels = task_tensor.long().view(-1)
+                        valid = labels != 255
+                        valid_ratio = float(valid.float().mean().item())
+                        stat += f",valid_ratio={valid_ratio:.6f}"
+                        if task_name in {'semseg', 'human_parts'} and valid.any():
+                            valid_labels = labels[valid]
+                            uniq, counts = torch.unique(valid_labels, return_counts=True)
+                            topk = min(3, uniq.numel())
+                            if topk > 0:
+                                order = torch.argsort(counts, descending=True)[:topk]
+                                top_items = [f"{int(uniq[i])}:{int(counts[i])}" for i in order]
+                                stat += f",top_labels={','.join(top_items)}"
+                    target_stats.append(stat)
+            else:
+                target_tensor = targets.float()
+                target_stats.append(f"cls:mean={float(target_tensor.mean().item()):.6f},std={float(target_tensor.std().item()):.6f}")
 
-                logger.info(
-                    "[debug_repro] epoch=%d step=%d ids=%s sample(mean=%.6f,std=%.6f) target_stats=[%s] output_stats=[%s] loss=%.6f",
-                    epoch,
-                    idx,
-                    batch_ids,
-                    sample_mean,
-                    sample_std,
-                    "; ".join(target_stats),
-                    "; ".join(output_stats),
-                    float(loss.item()),
-                )
+            output_stats = []
+            if isinstance(outputs, dict):
+                for task_name, out in outputs.items():
+                    out = out.float()
+                    output_stats.append(f"{task_name}:mean={float(out.mean().item()):.6f},std={float(out.std().item()):.6f}")
+            else:
+                out = outputs.float()
+                output_stats.append(f"cls:mean={float(out.mean().item()):.6f},std={float(out.std().item()):.6f}")
 
-            is_second_order = hasattr(
-                optimizer, 'is_second_order') and optimizer.is_second_order
-            grad_norm = loss_scaler(loss, optimizer, clip_grad=config.TRAIN.CLIP_GRAD,
-                                    parameters=model.parameters(), create_graph=is_second_order,
-                                    update_grad=(idx + 1) % config.TRAIN.ACCUMULATION_STEPS == 0)
+            logger.info(
+                "[debug_repro] epoch=%d step=%d ids=%s sample(mean=%.6f,std=%.6f) target_stats=[%s] output_stats=[%s] loss=%.6f",
+                epoch,
+                idx,
+                batch_ids,
+                sample_mean,
+                sample_std,
+                "; ".join(target_stats),
+                "; ".join(output_stats),
+                float(loss.item()),
+            )
+
+        should_measure_cr = False
+        if compute_cr:
+            should_measure_cr = ((idx + 1) % cr_period == 0) or (idx == num_steps - 1)
+
+        if should_measure_cr:
+            batch_cr = _compute_conflict_ratio(loss_dict, shared_params_for_cr, task_order_for_cr, task_weights_for_cr)
+            cr_sum += batch_cr
+            cr_count += 1
+            if cr_records is not None:
+                cr_records.append({
+                    'epoch': epoch,
+                    'batch': idx,
+                    'global_step': global_step,
+                    'cr': batch_cr,
+                })
+
+        is_second_order = hasattr(
+            optimizer, 'is_second_order') and optimizer.is_second_order
+        grad_norm = loss_scaler(loss, optimizer, clip_grad=config.TRAIN.CLIP_GRAD,
+                                parameters=model.parameters(), create_graph=is_second_order,
+                                update_grad=(idx + 1) % config.TRAIN.ACCUMULATION_STEPS == 0)
         if (idx + 1) % config.TRAIN.ACCUMULATION_STEPS == 0:
             optimizer.zero_grad()
             lr_scheduler.step_update(
@@ -491,6 +776,9 @@ def train_one_epoch(config, model, criterion, data_loader, optimizer, epoch, mix
             if loss_dict is not None:
                 for task, task_loss in loss_dict.items():
                     metrics[f"train/tasks/{task}/loss"] = task_loss.item()
+            if constraint_metrics is not None:
+                metrics.update(_flatten_constrained_step_metrics(
+                    constraint_metrics))
             wandb.log(metrics)
 
         if idx % config.PRINT_FREQ == 0:
@@ -506,6 +794,11 @@ def train_one_epoch(config, model, criterion, data_loader, optimizer, epoch, mix
                 f'grad_norm {norm_meter.val:.4f} ({norm_meter.avg:.4f})\t'
                 f'loss_scale {scaler_meter.val:.4f} ({scaler_meter.avg:.4f})\t'
                 f'mem {memory_used:.0f}MB')
+            if constraint_metrics is not None:
+                constraint_summary_text = constraint_controller.format_step_summary(
+                    constraint_metrics)
+                if constraint_summary_text:
+                    logger.info(f"ConstrainedMTL: {constraint_summary_text}")
 
     if config.EVAL_TRAINING is not None and (epoch % config.EVAL_TRAINING == 0):
         print("Training Eval:")
@@ -541,6 +834,8 @@ def train_one_epoch(config, model, criterion, data_loader, optimizer, epoch, mix
     epoch_time = time.perf_counter() - start
     logger.info(
         f"EPOCH {epoch} training takes {datetime.timedelta(seconds=int(epoch_time))}")
+
+    return (cr_records if compute_cr else None, cr_sum if compute_cr else 0.0, cr_count if compute_cr else 0.0)
 
 
 @torch.no_grad()
@@ -777,20 +1072,17 @@ if __name__ == '__main__':
         wandb_available = False
         logger.info("Wandb logging disabled.")
     elif wandb_available:
-        if dist.get_rank() == 0:
-            try:
-                if not os.getenv("WANDB_API_KEY"):
-                    wandb.login()
-                else:
-                    wandb.login(key=os.getenv("WANDB_API_KEY"))
-                config_name = f"{os.path.basename(os.path.dirname(args.cfg))}/{os.path.basename(args.cfg)}"
-                wandb.init(project='MTLoRA', config=config,
-                           name=config_name if not args.run_name else args.run_name)
-                wandb.config.update({'args': vars(args)})
-            except wandb.exc.LaunchError:
-                logger.warning("Could not initialize wandb. Logging is disabled.")
-                wandb_available = False
-        else:
+        try:
+            if not os.getenv("WANDB_API_KEY"):
+                wandb.login()
+            else:
+                wandb.login(key=os.getenv("WANDB_API_KEY"))
+            config_name = f"{os.path.basename(os.path.dirname(args.cfg))}/{os.path.basename(args.cfg)}"
+            wandb.init(project='MTLoRA', config=config,
+                       name=config_name if not args.run_name else args.run_name)
+            wandb.config.update({'args': vars(args)})
+        except wandb.exc.LaunchError:
+            logger.warnning("Could not initialize wandb. Logging is disabled.")
             wandb_available = False
 
     main(config)

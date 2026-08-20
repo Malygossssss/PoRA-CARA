@@ -150,6 +150,23 @@ torchrun --nproc_per_node=1 main.py `
   --skip_initial_validation
 ```
 
+如果需要与 UniPoRA 当前代码严格一致的双卡启动：
+
+```bash
+CUDA_VISIBLE_DEVICES=6,7 torchrun \
+  --nproc_per_node=2 \
+  --master_port=29501 \
+  main.py \
+  --cfg output/<MODEL.NAME>/<TAG>/ag_mtlora_stage1_prepare/run_<timestamp>/resolved_agmtlora_config__group_proxy.yaml \
+  --pascal /path/to/PASCAL_MT \
+  --tasks semseg,normals,sal,human_parts \
+  --batch-size 8 \
+  --epochs 300 \
+  --resume output/<MODEL.NAME>/<TAG>/ag_mtlora_stage1_prepare/run_<timestamp>/post_affinity_checkpoint.pth
+```
+
+这里的“双卡”严格采用 UniPoRA 语义：两个 rank 各自读取完整训练集并独立更新模型，不使用 DDP，也不平均梯度；checkpoint 仍只保存 rank 0 的模型。每个进程使用 `--batch-size` 指定的 batch，同时学习率仍按 `WORLD_SIZE=2` 缩放。
+
 推荐使用 `--resume post_affinity_checkpoint.pth`，原因是：
 
 - Stage-1 已经训练过 global shared LoRA。

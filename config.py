@@ -215,6 +215,11 @@ _C.TRAIN.ACCUMULATION_STEPS = 1
 # Whether to use gradient checkpointing to save memory
 # could be overwritten by command line argument
 _C.TRAIN.USE_CHECKPOINT = False
+# Enable computing conflict gradient ratio (CR)
+_C.TRAIN.ENABLE_CONFLICT_RATIO = False
+# Number of batches between conflict ratio evaluations when enabled
+_C.TRAIN.CONFLICT_RATIO_PERIOD = 50
+
 # LR scheduler
 _C.TRAIN.LR_SCHEDULER = CN()
 _C.TRAIN.LR_SCHEDULER.NAME = 'cosine'
@@ -252,6 +257,26 @@ _C.TRAIN.LAYER_DECAY = 1.0
 _C.TRAIN.MOE = CN()
 # Only save model on master device
 _C.TRAIN.MOE.SAVE_MASTER = False
+
+# Constrained multi-task training
+_C.TRAIN.CONSTRAINED_MTL = CN()
+_C.TRAIN.CONSTRAINED_MTL.ENABLED = False
+_C.TRAIN.CONSTRAINED_MTL.PROTECTED_TASKS = []
+_C.TRAIN.CONSTRAINED_MTL.OBJECTIVE = 'avg_unconstrained'
+_C.TRAIN.CONSTRAINED_MTL.REF_MODE = 'warmup_loss'
+_C.TRAIN.CONSTRAINED_MTL.REF_EPOCH_START = 0
+_C.TRAIN.CONSTRAINED_MTL.REF_EPOCH_END = 0
+_C.TRAIN.CONSTRAINED_MTL.WARMUP_EPOCHS = 20
+_C.TRAIN.CONSTRAINED_MTL.USE_RELATIVE_LOSS = True
+_C.TRAIN.CONSTRAINED_MTL.EPS_RELAX = CN(new_allowed=True)
+_C.TRAIN.CONSTRAINED_MTL.REF_LOSSES = CN(new_allowed=True)
+_C.TRAIN.CONSTRAINED_MTL.DUAL_UPDATE_FREQ = 'epoch'
+_C.TRAIN.CONSTRAINED_MTL.DUAL_LR = 0.05
+_C.TRAIN.CONSTRAINED_MTL.DUAL_CLAMP_MAX = 10.0
+_C.TRAIN.CONSTRAINED_MTL.ALM_RHO = 1.0
+_C.TRAIN.CONSTRAINED_MTL.ALM_RHO_GROWTH = 1.5
+_C.TRAIN.CONSTRAINED_MTL.ALM_RHO_PATIENCE = 5
+_C.TRAIN.CONSTRAINED_MTL.VIOLATION_EMA = 0.9
 # -----------------------------------------------------------------------------
 # Augmentation settings
 # -----------------------------------------------------------------------------
@@ -559,6 +584,15 @@ def update_config(config, args):
 
     # output folder
     config.OUTPUT = os.path.join(config.OUTPUT, config.MODEL.NAME, config.TAG)
+
+    constrained_cfg = config.TRAIN.CONSTRAINED_MTL
+    if isinstance(constrained_cfg.PROTECTED_TASKS, str):
+        constrained_cfg.PROTECTED_TASKS = re.compile(
+            r'\s*,\s*').split(constrained_cfg.PROTECTED_TASKS)
+    elif constrained_cfg.PROTECTED_TASKS is None:
+        constrained_cfg.PROTECTED_TASKS = []
+    else:
+        constrained_cfg.PROTECTED_TASKS = list(constrained_cfg.PROTECTED_TASKS)
 
     if config.MODEL.PROMPT.ENABLED:
         if not config.MODEL.MTLORA.ENABLED:

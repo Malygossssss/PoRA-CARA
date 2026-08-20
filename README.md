@@ -90,11 +90,23 @@ python -m torch.distributed.launch --nproc_per_node 1 main.py \
   --resume-backbone backbone/swin_tiny_patch4_window7_224.pth
 ```
 
-# Single GPU (backward compatible)
+### Process launch semantics
+
+```bash
+# Single process
 torchrun --nproc_per_node=1 main.py --cfg configs/... --tasks semseg,normals,sal,human_parts ...
 
-# Multi GPU
-torchrun --nproc_per_node=4 main.py --cfg configs/... --tasks semseg,normals,sal,human_parts ...
+# Two independent GPU processes (aligned with UniPoRA)
+CUDA_VISIBLE_DEVICES=6,7 torchrun --nproc_per_node=2 --master_port=29501 \
+  main.py --cfg configs/... --tasks semseg,normals,sal,human_parts ...
+```
+
+The multi-process command intentionally matches the current UniPoRA training
+semantics. It does **not** wrap the model with `DistributedDataParallel` and it
+does **not** shard the MTL dataset. Every rank trains an independent model over
+the complete dataset; only the rank-0 model is written by the checkpoint path.
+`DATA.BATCH_SIZE` remains the batch size used by each independent process, while
+the learning-rate scaling formula still includes `WORLD_SIZE`, as in UniPoRA.
 
 ## Available Configs
 
