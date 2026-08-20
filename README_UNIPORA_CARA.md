@@ -79,6 +79,22 @@ python scripts/ag_mtlora_stage1_prepare.py \
   --resume-backbone backbone/Swin/swin_tiny_patch4_window7_224.pth
 ```
 
+若要让 Stage-1 与正式训练采用相同的双进程启动方式，可运行：
+
+```bash
+CUDA_VISIBLE_DEVICES=6,7 python -m torch.distributed.launch \
+  --nproc_per_node 2 \
+  --master_port 29501 \
+  scripts/ag_mtlora_stage1_prepare.py \
+  --cfg configs/mtlora/tiny_448/pascal/unipora_cara_tiny_448_r64_prom50_global_group_proxy.yaml \
+  --pascal PASCAL_MT \
+  --tasks semseg,normals,sal,human_parts \
+  --batch-size 32 \
+  --resume-backbone backbone/Swin/swin_tiny_patch4_window7_224.pth
+```
+
+这里严格延续当前 UniPoRA 双卡语义：两个 rank 都读取完整数据、各自构建模型并独立完成 Stage-1 搜索，不使用 DDP、`DistributedSampler`、梯度同步或 affinity 平均。rank 0 使用 `SEED`，rank 1 使用 `SEED + 1`；rank 0 的 grouping、resolved config 和 checkpoint 是后续正式训练的规范结果，rank 1 只作为独立诊断结果。
+
 这一步会发生以下事情：
 
 - `MODEL.PROMPT.ENABLED` 保持为 `True`，Stage-1 会构建并训练每个 task 独立的 prompt。
@@ -90,7 +106,7 @@ python scripts/ag_mtlora_stage1_prepare.py \
 
 Prompt-on 会为每个 task 分别执行 prompted backbone forward，显存占用和运行时间通常高于 Prompt-off。如果 `--batch-size 32` 显存不足，应按实际设备减小 batch size。
 
-Stage-1 输出目录通常位于：
+单进程 Stage-1 的输出目录保持不变，通常位于：
 
 ```text
 output/<MODEL.NAME>/<TAG>/ag_mtlora_stage1_prepare/run_<timestamp>/
@@ -110,6 +126,21 @@ resolved_agmtlora_runtime_snapshot__group_proxy.yaml
 warmup_checkpoint.pth
 post_affinity_checkpoint.pth
 ```
+
+双进程 Stage-1 会在共享 run 根目录下按 rank 隔离产物：
+
+```text
+output/<MODEL.NAME>/<TAG>/ag_mtlora_stage1_prepare/run_<timestamp>/
+├── rank_0/                       # 规范结果，供正式训练使用
+│   ├── resolved_agmtlora_config__group_proxy.yaml
+│   ├── post_affinity_checkpoint.pth
+│   └── stage1_artifacts.json
+├── rank_1/                       # 独立诊断结果
+│   └── stage1_artifacts.json
+└── stage1_multi_process_manifest.json
+```
+
+双进程续跑时，`--resume-stage1-dir` 应传共享的 `run_<timestamp>` 根目录；脚本会为每个进程自动选择对应的 `rank_<n>` 子目录。若相应 rank 目录不存在，脚本会直接报错，避免不同 rank 混用 artifacts。
 
 其中最重要的是：
 
@@ -157,12 +188,12 @@ CUDA_VISIBLE_DEVICES=6,7 torchrun \
   --nproc_per_node=2 \
   --master_port=29501 \
   main.py \
-  --cfg output/<MODEL.NAME>/<TAG>/ag_mtlora_stage1_prepare/run_<timestamp>/resolved_agmtlora_config__group_proxy.yaml \
+  --cfg output/<MODEL.NAME>/<TAG>/ag_mtlora_stage1_prepare/run_<timestamp>/rank_0/resolved_agmtlora_config__group_proxy.yaml \
   --pascal /path/to/PASCAL_MT \
   --tasks semseg,normals,sal,human_parts \
   --batch-size 8 \
   --epochs 300 \
-  --resume output/<MODEL.NAME>/<TAG>/ag_mtlora_stage1_prepare/run_<timestamp>/post_affinity_checkpoint.pth
+  --resume output/<MODEL.NAME>/<TAG>/ag_mtlora_stage1_prepare/run_<timestamp>/rank_0/post_affinity_checkpoint.pth
 ```
 
 这里的“双卡”严格采用 UniPoRA 语义：两个 rank 各自读取完整训练集并独立更新模型，不使用 DDP，也不平均梯度；checkpoint 仍只保存 rank 0 的模型。每个进程使用 `--batch-size` 指定的 batch，同时学习率仍按 `WORLD_SIZE=2` 缩放。

@@ -108,6 +108,23 @@ the complete dataset; only the rank-0 model is written by the checkpoint path.
 `DATA.BATCH_SIZE` remains the batch size used by each independent process, while
 the learning-rate scaling formula still includes `WORLD_SIZE`, as in UniPoRA.
 
+Stage-1 grouping search supports the same two-process launcher:
+
+```bash
+CUDA_VISIBLE_DEVICES=6,7 python -m torch.distributed.launch \
+  --nproc_per_node 2 --master_port 29501 \
+  scripts/ag_mtlora_stage1_prepare.py \
+  --cfg configs/mtlora/tiny_448/pascal/ag_mtlora_stage1_tiny_448_r64_scale4_pertask.yaml \
+  --pascal /path/to/PASCAL_MT \
+  --tasks semseg,normals,sal,human_parts \
+  --resume-backbone backbone/swin_tiny_patch4_window7_224.pth
+```
+
+Each rank performs a complete independent search with seed `SEED + rank` and
+writes to `run_<timestamp>/rank_<rank>/`. Rank 0 is canonical; use its resolved
+config and checkpoint for Step-2. No DDP, data sharding, gradient synchronization,
+or affinity averaging is performed. Single-process Stage-1 paths remain unchanged.
+
 ## Available Configs
 
 Kept MTLoRA configs:

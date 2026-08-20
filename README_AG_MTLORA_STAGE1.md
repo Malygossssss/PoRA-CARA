@@ -37,6 +37,8 @@ AG-MTLoRA Stage-1 是在当前 MTLoRA / UniPoRA 代码基础上实现的一个 g
   - grouping / partition 枚举、group rank 解析、artifact 路径解析。
 - `ag_mtlora/stage1.py`
   - Stage-1 prepare 主流程：warmup、多 epoch directed affinity、group proxy、predictor chain、partition search、artifact 导出。
+- `ag_mtlora/stage1_multiprocess.py`
+  - 解析 rank 环境、隔离各 rank 输出目录，并生成单 rank 与共享 run manifest。
 - `scripts/ag_mtlora_stage1_prepare.py`
   - 两步工作流中的 Step-1 入口脚本。
 - `scripts/ag_mtlora_stage1_replay_search.py`
@@ -274,6 +276,46 @@ python scripts/ag_mtlora_stage1_prepare.py \
   --resume-backbone backbone/swin_tiny_patch4_window7_224.pth
 ```
 
+#### 双进程独立搜索
+
+Stage-1 现在也支持与正式训练一致的双进程启动：
+
+```bash
+CUDA_VISIBLE_DEVICES=6,7 python -m torch.distributed.launch \
+  --nproc_per_node 2 \
+  --master_port 29501 \
+  scripts/ag_mtlora_stage1_prepare.py \
+  --cfg configs/mtlora/tiny_448/pascal/ag_mtlora_stage1_tiny_448_r64_scale4_pertask.yaml \
+  --pascal /path/to/PASCAL_MT \
+  --tasks semseg,normals,sal,human_parts \
+  --batch-size 24 \
+  --resume-backbone backbone/swin_tiny_patch4_window7_224.pth
+```
+
+也可使用等价的 `torchrun --nproc_per_node=2 --master_port=29501 ...`。脚本同时接受 launcher 注入的 `--local_rank` 和 `--local-rank`。
+
+双进程严格采用当前 UniPoRA 的独立进程语义：
+
+- 每个 rank 读取完整数据并独立执行 warmup、affinity 和分组搜索。
+- 不使用 DDP、`DistributedSampler`、梯度同步、affinity 平均或 grouping 合并。
+- 每个进程的 `--batch-size` 含义不变；rank `n` 使用 `config.SEED + n`。
+- rank 0 产物是后续正式训练的规范输入，其他 rank 产物用于稳定性诊断。
+
+输出会写入同一个 run 根目录下互不覆盖的 rank 子目录：
+
+```text
+output/<model_name>/<tag>/ag_mtlora_stage1_prepare/run_<timestamp>/
+├── rank_0/
+│   ├── resolved_agmtlora_config.yaml
+│   ├── post_affinity_checkpoint.pth
+│   └── stage1_artifacts.json
+├── rank_1/
+│   └── stage1_artifacts.json
+└── stage1_multi_process_manifest.json
+```
+
+正式训练应读取 `rank_0/resolved_agmtlora_config*.yaml`，如需继承 Stage-1 权重则同时读取 `rank_0/post_affinity_checkpoint.pth`。
+
 NYUD 四任务示例：
 
 ```bash
@@ -296,6 +338,22 @@ python scripts/ag_mtlora_stage1_prepare.py \
   --resume-backbone backbone/swin_tiny_patch4_window7_224.pth \
   --opts MODEL.AGMTLORA.SEARCH_SCORE_SOURCE group_proxy
 ```
+
+双进程续跑时仍用相同的 launcher，并把共享 run 根目录传给 `--resume-stage1-dir`：
+
+```bash
+CUDA_VISIBLE_DEVICES=6,7 python -m torch.distributed.launch \
+  --nproc_per_node 2 \
+  --master_port 29501 \
+  scripts/ag_mtlora_stage1_prepare.py \
+  --cfg configs/mtlora/tiny_448/pascal/ag_mtlora_stage1_tiny_448_r64_scale4_pertask.yaml \
+  --pascal /path/to/PASCAL_MT \
+  --tasks semseg,normals,sal,human_parts \
+  --resume-stage1-dir output/<model_name>/<tag>/ag_mtlora_stage1_prepare/run_<timestamp> \
+  --opts MODEL.AGMTLORA.SEARCH_SCORE_SOURCE group_proxy
+```
+
+每个进程会自动映射到自己的 `rank_<n>` 子目录；缺少相应 rank 目录时会报错。单进程续跑仍直接传原来的 Stage-1 输出目录，目录兼容性不变。
 
 如果你已经有一个完整的 Stage-1 输出目录，并且只想复用已有 affinity / group proxy 重做 search，不重新跑 warmup、affinity 和 predictor chain，可以直接使用离线 replay 脚本：
 

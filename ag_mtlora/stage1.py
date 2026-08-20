@@ -2225,6 +2225,6 @@ def run_stage1_pipeline(config: CN, output_root: str, logger, base_cfg_path: str
     }
 
 
-def create_stage1_logger(output_root: str):
+def create_stage1_logger(output_root: str, dist_rank: int = 0):
     mkdir_if_missing(output_root)
-    return create_logger(output_dir=output_root, dist_rank=0, name="ag_mtlora_stage1")
+    return create_logger(output_dir=output_root, dist_rank=dist_rank, name="ag_mtlora_stage1")
