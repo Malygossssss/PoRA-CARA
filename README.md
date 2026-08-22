@@ -141,12 +141,15 @@ Kept MTLoRA configs:
 - `configs/mtlora/tiny_448/nyud/ag_mtlora_stage1_tiny_448_r64_scale4_pertask_nyud.yaml`
 - `configs/mtlora/tiny_448/pascal/ag_mtlora_stage1_tiny_448_r64_scale4_pertask_stagewise_proxy.yaml`
 - `configs/mtlora/tiny_448/nyud/ag_mtlora_stage1_tiny_448_r64_scale4_pertask_nyud_stagewise_proxy.yaml`
+- `configs/mtlora/tiny_448/pascal/unipora_cara_tiny_448_r64_prom50_global_group_proxy_2lr.yaml`
 
 Standard Swin baselines are kept under `configs/swin/`.
 
 ## Utilities
 
 AG-MTLoRA Stage-1 specific workflow, search configuration, replay-search usage, and the new stage-wise partition mode are documented in `README_AG_MTLORA_STAGE1.md`.
+
+The recommended end-to-end UniPoRA-CARA workflow uses the inherited `_2lr.yaml` config above. Stage-1 consumes its `BASE_LR=1e-3` directly, while formal training inherits all three learning-rate fields through the generated resolved config. See `README_UNIPORA_CARA.md`.
 
 Stage-wise partition example configs:
 

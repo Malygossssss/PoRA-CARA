@@ -11,21 +11,28 @@
 
 ## 1. 推荐配置
 
-基础配置使用：
+推荐直接使用端到端 2lr 配置：
 
 ```text
-configs/mtlora/tiny_448/pascal/ag_promlora_tiny_448_r64_prom50_global_group_proxy.yaml
+configs/mtlora/tiny_448/pascal/unipora_cara_tiny_448_r64_prom50_global_group_proxy_2lr.yaml
 ```
 
-建议先复制一份新配置，避免覆盖原始实验配置，例如：
+该文件通过 `BASE` 继承原来的 UniPoRA-CARA 配置，只覆盖实验名和学习率：
 
-```powershell
-Copy-Item `
-  configs\mtlora\tiny_448\pascal\ag_promlora_tiny_448_r64_prom50_global_group_proxy.yaml `
-  configs\mtlora\tiny_448\pascal\unipora_cara_tiny_448_r64_prom50_global_group_proxy.yaml
+```yaml
+BASE:
+  - unipora_cara_tiny_448_r64_prom50_global_group_proxy.yaml
+
+MODEL:
+  NAME: unipora_cara_tiny_448_r64_prom50_global_group_proxy_2lr
+
+TRAIN:
+  BASE_LR: 1.0e-3
+  WARMUP_LR: 1.0e-6
+  MIN_LR: 1.0e-5
 ```
 
-然后把新配置中的 `MODEL.MTLORA.R_PER_TASK` 改成：
+被继承的基础配置已经将 `MODEL.MTLORA.R_PER_TASK` 设置为：
 
 ```yaml
 R_PER_TASK:
@@ -36,7 +43,7 @@ R_PER_TASK:
   shared: [64]
 ```
 
-保持 prompt 配置开启：
+同时保持 prompt 配置开启：
 
 ```yaml
 PROMPT:
@@ -48,7 +55,7 @@ PROMPT:
   DROPOUT: 0.0
 ```
 
-保持 CARA 搜索配置：
+并保持 CARA 搜索配置：
 
 ```yaml
 AGMTLORA:
@@ -63,6 +70,8 @@ AGMTLORA:
 
 - `semseg/normals/sal/human_parts: [0]` 会在配置解析时扩展成每个 Swin stage 都为 0。
 - `shared: [64]` 会扩展成每个 Swin stage 的 shared rank 都为 64。
+- Stage-1 直接使用固定的 `BASE_LR=1e-3`；它没有 scheduler，因此 `WARMUP_LR` 和 `MIN_LR` 在 Stage-1 不参与计算。
+- 正式训练会继承全部三个学习率字段，并继续按 batch size、`WORLD_SIZE` 和 accumulation steps 使用与 UniPoRA 一致的缩放及 scheduler。
 - Stage-1 搜索时还没有固定 group，因此使用的是普通 global shared LoRA。
 - 分组完成后，正式训练使用生成的 resolved config，代码会把 global shared LoRA 路由切换成 group-shared LoRA。
 
@@ -72,7 +81,7 @@ Stage-1 的目标是在 task-specific prompt 开启的条件下，只对 shared 
 
 ```bash
 python scripts/ag_mtlora_stage1_prepare.py \
-  --cfg configs/mtlora/tiny_448/pascal/unipora_cara_tiny_448_r64_prom50_global_group_proxy.yaml \
+  --cfg configs/mtlora/tiny_448/pascal/unipora_cara_tiny_448_r64_prom50_global_group_proxy_2lr.yaml \
   --pascal PASCAL_MT \
   --tasks semseg,normals,sal,human_parts \
   --batch-size 32 \
@@ -86,7 +95,7 @@ CUDA_VISIBLE_DEVICES=6,7 python -m torch.distributed.launch \
   --nproc_per_node 2 \
   --master_port 29501 \
   scripts/ag_mtlora_stage1_prepare.py \
-  --cfg configs/mtlora/tiny_448/pascal/unipora_cara_tiny_448_r64_prom50_global_group_proxy.yaml \
+  --cfg configs/mtlora/tiny_448/pascal/unipora_cara_tiny_448_r64_prom50_global_group_proxy_2lr.yaml \
   --pascal PASCAL_MT \
   --tasks semseg,normals,sal,human_parts \
   --batch-size 32 \
@@ -94,6 +103,8 @@ CUDA_VISIBLE_DEVICES=6,7 python -m torch.distributed.launch \
 ```
 
 这里严格延续当前 UniPoRA 双卡语义：两个 rank 都读取完整数据、各自构建模型并独立完成 Stage-1 搜索，不使用 DDP、`DistributedSampler`、梯度同步或 affinity 平均。rank 0 使用 `SEED`，rank 1 使用 `SEED + 1`；rank 0 的 grouping、resolved config 和 checkpoint 是后续正式训练的规范结果，rank 1 只作为独立诊断结果。
+
+2lr 是端到端实验配置，必须用它创建新的 Stage-1 run。不要通过 `--resume-stage1-dir` 复用旧学习率生成的 affinity/grouping，也不要把旧 `post_affinity_checkpoint.pth` 用作新的 2lr 正式训练初始化。
 
 这一步会发生以下事情：
 
@@ -298,7 +309,7 @@ Stage-1 使用 Prompt-on，因此 `post_affinity_checkpoint.pth` 中包含已经
 建议将这一组实验命名为：
 
 ```text
-unipora_cara_tiny_448_r64_prom50_global_group_proxy
+unipora_cara_tiny_448_r64_prom50_global_group_proxy_2lr
 ```
 
 含义：
@@ -308,3 +319,4 @@ unipora_cara_tiny_448_r64_prom50_global_group_proxy
 - `r64`：shared LoRA rank 为 64。
 - `prom50`：Stage-1 和正式训练都使用 50 个 prompt token。
 - `global_group_proxy`：全网络共享一个 task grouping，并用 group proxy 做搜索评分。
+- `2lr`：Stage-1 的 `BASE_LR` 和正式训练的三个学习率字段均为原默认值的 2 倍。
