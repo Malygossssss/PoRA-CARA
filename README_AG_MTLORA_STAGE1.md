@@ -83,6 +83,13 @@ AG-MTLoRA Stage-1 是在当前 MTLoRA / UniPoRA 代码基础上实现的一个 g
 - 这一步按 batch 在线累计 directed affinity
 - 结束后保存 `post_affinity_checkpoint.pth`
 
+两段共用同一个 optimizer/runtime：配置中的三个学习率先按
+`batch_size * WORLD_SIZE * accumulation_steps / 512` 缩放一次；warmup 段线性
+升温，affinity 段 cosine 衰减。forward/loss 使用 autocast，反向使用
+GradScaler，并应用 `TRAIN.CLIP_GRAD`。PASCAL 中某个 batch 的
+human-parts 标签全部为 ignore 时，该任务返回可求导的零损失，避免
+`NLLLoss(mean)` 产生 NaN。
+
 这一步与 ETAP 对齐的地方是：
 
 - affinity 来自 baseline 持续训练轨迹
@@ -187,6 +194,20 @@ baseline checkpoint 初始化规则：
 - `post_affinity_checkpoint.pth` 是多 epoch affinity-score 累计结束后的 baseline 检查点。
 - Step-2 默认推荐从 `post_affinity_checkpoint.pth` 初始化。
 - 加载时会自动把单一 shared TA 权重复制到每个 group-specific TA bank。
+- `post_affinity_checkpoint.pth` 只有在全量 state 有限且 train-mode AMP
+  forward/backward smoke test 通过后才会原子发布。
+
+失败诊断规则：
+
+- 每个健康 epoch 原子更新 `last_good_checkpoint.pth`。
+- 任何非有限 output、task loss、total loss、affinity gradient/dot、grad norm、
+  loss scale、参数或 buffer 都会立即中止。
+- 日志以 `STAGE1_ABORTED` 结束，同时写 `failure_report.json`（多进程为
+  `failure_report_rankN.json`）和 `status: failed` 的
+  `stage1_artifacts.json`；报告包含 traceback、phase/epoch/batch/task、sample
+  IDs、有效标签比例、坏 tensor 统计、GPU 显存与运行时版本。
+- 只有日志以 `STAGE1_COMPLETED` 结束且 manifest 为 `status: complete` 的 run
+  才能进入 Step-2。
 
 ## 5. Shared rank 配置
 
@@ -353,9 +374,9 @@ CUDA_VISIBLE_DEVICES=6,7 python -m torch.distributed.launch \
   --opts MODEL.AGMTLORA.SEARCH_SCORE_SOURCE group_proxy
 ```
 
-每个进程会自动映射到自己的 `rank_<n>` 子目录；缺少相应 rank 目录时会报错。单进程续跑仍直接传原来的 Stage-1 输出目录，目录兼容性不变。
+每个进程会自动映射到自己的 `rank_<n>` 子目录；缺少相应 rank 目录时会报错。单进程续跑仍直接传原来的 Stage-1 输出目录。续跑只接受带有当前数值稳定性 schema、有限 state/affinity 和已通过 AMP smoke test 的新产物；修复前目录会立即失败并写诊断报告，不能借续跑入口重新标成成功。
 
-如果你已经有一个完整的 Stage-1 输出目录，并且只想复用已有 affinity / group proxy 重做 search，不重新跑 warmup、affinity 和 predictor chain，可以直接使用离线 replay 脚本：
+如果你已经有一个通过当前数值稳定性验收的完整 Stage-1 输出目录，并且只想复用已有 affinity / group proxy 重做 search，不重新跑 warmup、affinity 和 predictor chain，可以直接使用离线 replay 脚本。replay 同样拒绝缺少当前 schema 的旧搜索产物：
 
 ```bash
 python scripts/ag_mtlora_stage1_replay_search.py \

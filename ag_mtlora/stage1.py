@@ -4,6 +4,7 @@ import json
 import os
 import random
 import re
+from dataclasses import dataclass
 from typing import Dict, Iterable, List, Optional, Sequence
 
 import numpy as np
@@ -15,6 +16,7 @@ from yacs.config import CfgNode as CN
 
 from ag_mtlora.config_utils import (
     DEFAULT_PARTITION_GRANULARITY,
+    STAGE1_RUNTIME_SCHEMA_VERSION,
     build_task_to_group_by_stage,
     build_task_to_group,
     canonicalize_groups,
@@ -36,11 +38,17 @@ from data.mtl_ds import (
     get_transformations,
 )
 from logger import create_logger
+from lr_scheduler import build_scheduler
 from models import build_model, build_mtl_model
 from models.lora import mark_only_lora_as_trainable, mark_prompt_as_trainable
 from mtl_loss_schemes import MultiTaskLoss, get_loss
 from optimizer import build_optimizer
-from utils import load_checkpoint, load_pretrained, mkdir_if_missing
+from utils import (
+    NativeScalerWithGradNormCount,
+    load_checkpoint,
+    load_pretrained,
+    mkdir_if_missing,
+)
 
 
 DEFAULT_TASK_LOSS_WEIGHTS = {
@@ -56,6 +64,224 @@ PREDICTOR_PROGRESS_FILENAME = "predictor_progress.json"
 DEFAULT_SEARCH_SCORE_SOURCE = "final_predictions"
 SUPPORTED_SEARCH_SCORE_SOURCES = {"final_predictions", "group_proxy"}
 SHARED_PARAM_STAGE_PATTERN = re.compile(r"backbone\.layers\.(\d+)\.")
+
+
+@dataclass
+class Stage1TrainRuntime:
+    optimizer: object
+    lr_scheduler: object
+    loss_scaler: object
+    amp_enabled: bool
+    clip_grad: Optional[float]
+    global_step: int = 0
+
+    @property
+    def learning_rate(self) -> float:
+        return float(self.optimizer.param_groups[0]["lr"])
+
+    @property
+    def loss_scale(self) -> float:
+        state = self.loss_scaler.state_dict()
+        return float(state.get("scale", 1.0))
+
+
+class Stage1NumericalError(RuntimeError):
+    def __init__(self, message: str, details: Optional[Dict] = None):
+        self.details = dict(details or {})
+        super().__init__(message)
+
+
+def update_stage1_execution_context(execution_context: Optional[Dict], **updates) -> Dict:
+    if execution_context is None:
+        execution_context = {}
+    execution_context.update({key: value for key, value in updates.items() if value is not None})
+    return execution_context
+
+
+def get_batch_sample_ids(batch) -> List[str]:
+    if not isinstance(batch, dict):
+        return []
+    meta = batch.get("meta")
+    if not isinstance(meta, dict) or "image" not in meta:
+        return []
+    image_ids = meta["image"]
+    if isinstance(image_ids, (list, tuple)):
+        return [str(value) for value in image_ids]
+    return [str(image_ids)]
+
+
+def get_target_valid_ratios(targets: Dict[str, torch.Tensor]) -> Dict[str, float]:
+    ratios = {}
+    for task, target in targets.items():
+        if not torch.is_tensor(target) or target.numel() == 0:
+            continue
+        if task in {"semseg", "human_parts", "normals", "depth"}:
+            ratios[task] = float((target != 255).float().mean().item())
+        else:
+            ratios[task] = 1.0
+    return ratios
+
+
+def _tensor_failure_stats(tensor: torch.Tensor) -> Dict:
+    detached = tensor.detach()
+    finite_mask = torch.isfinite(detached)
+    finite_values = detached[finite_mask]
+    stats = {
+        "shape": list(detached.shape),
+        "dtype": str(detached.dtype),
+        "numel": int(detached.numel()),
+        "nonfinite_count": int((~finite_mask).sum().item()),
+    }
+    if finite_values.numel() > 0:
+        stats.update({
+            "finite_min": float(finite_values.min().item()),
+            "finite_max": float(finite_values.max().item()),
+            "finite_mean": float(finite_values.float().mean().item()),
+        })
+    return stats
+
+
+def ensure_finite_tensor(tensor: torch.Tensor, tensor_name: str, execution_context: Optional[Dict] = None):
+    if not torch.is_tensor(tensor) or not (tensor.is_floating_point() or tensor.is_complex()):
+        return
+    if bool(torch.isfinite(tensor).all().item()):
+        return
+    details = dict(execution_context or {})
+    details.update({
+        "tensor_name": tensor_name,
+        "tensor_stats": _tensor_failure_stats(tensor),
+    })
+    raise Stage1NumericalError(
+        f"Non-finite tensor detected during Stage-1: {tensor_name}",
+        details=details,
+    )
+
+
+def ensure_finite_number(value, value_name: str, execution_context: Optional[Dict] = None, positive=False):
+    numeric_value = float(value)
+    if np.isfinite(numeric_value) and (not positive or numeric_value > 0.0):
+        return
+    details = dict(execution_context or {})
+    details.update({"value_name": value_name, "value": numeric_value})
+    qualifier = "positive finite" if positive else "finite"
+    raise Stage1NumericalError(
+        f"Stage-1 expected {value_name} to be {qualifier}, got {numeric_value}",
+        details=details,
+    )
+
+
+def ensure_finite_outputs(outputs: Dict[str, torch.Tensor], execution_context: Optional[Dict] = None):
+    for task, output in outputs.items():
+        task_context = update_stage1_execution_context(dict(execution_context or {}), task=task)
+        ensure_finite_tensor(output, f"outputs.{task}", task_context)
+
+
+def find_first_nonfinite_state(model_or_state) -> Optional[Dict]:
+    state = model_or_state.state_dict() if hasattr(model_or_state, "state_dict") else model_or_state
+    for name, tensor in state.items():
+        if not torch.is_tensor(tensor) or not (tensor.is_floating_point() or tensor.is_complex()):
+            continue
+        if not bool(torch.isfinite(tensor).all().item()):
+            return {"tensor_name": name, "tensor_stats": _tensor_failure_stats(tensor)}
+    return None
+
+
+def ensure_finite_model_state(model_or_state, execution_context: Optional[Dict] = None):
+    failure = find_first_nonfinite_state(model_or_state)
+    if failure is None:
+        return
+    details = dict(execution_context or {})
+    details.update(failure)
+    raise Stage1NumericalError(
+        f"Non-finite model state detected during Stage-1: {failure['tensor_name']}",
+        details=details,
+    )
+
+
+def atomic_torch_save(payload: Dict, output_path: str) -> None:
+    mkdir_if_missing(os.path.dirname(output_path))
+    temporary_path = output_path + ".tmp"
+    torch.save(payload, temporary_path)
+    os.replace(temporary_path, output_path)
+
+
+def save_stage1_last_good_checkpoint(
+    working_dir: str,
+    model: nn.Module,
+    runtime: Stage1TrainRuntime,
+    phase: str,
+    epoch: int,
+) -> str:
+    execution_context = {"phase": phase, "epoch": int(epoch)}
+    ensure_finite_model_state(model, execution_context)
+    output_path = os.path.join(working_dir, "last_good_checkpoint.pth")
+    atomic_torch_save(
+        {
+            "model": clone_state_dict_to_cpu(model),
+            "optimizer": runtime.optimizer.state_dict(),
+            "lr_scheduler": runtime.lr_scheduler.state_dict(),
+            "scaler": runtime.loss_scaler.state_dict(),
+            "global_step": int(runtime.global_step),
+            "phase": phase,
+            "epoch": int(epoch),
+            "stage1_runtime_schema_version": STAGE1_RUNTIME_SCHEMA_VERSION,
+        },
+        output_path,
+    )
+    return output_path
+
+
+def build_stage1_scheduler_config(config: CN, warmup_epochs: int, total_epochs: int) -> CN:
+    scheduler_config = config.clone()
+    scheduler_config.defrost()
+    scheduler_config.TRAIN.EPOCHS = max(int(total_epochs), 1)
+    scheduler_config.TRAIN.WARMUP_EPOCHS = max(0, min(int(warmup_epochs), int(total_epochs)))
+    scheduler_config.freeze()
+    return scheduler_config
+
+
+def build_stage1_train_runtime(
+    config: CN,
+    model: nn.Module,
+    steps_per_epoch: int,
+    warmup_epochs: int,
+    total_epochs: int,
+) -> Stage1TrainRuntime:
+    optimizer = build_optimizer(config, model)
+    scheduler_config = build_stage1_scheduler_config(config, warmup_epochs, total_epochs)
+    lr_scheduler = build_scheduler(scheduler_config, optimizer, max(int(steps_per_epoch), 1))
+    clip_grad = float(config.TRAIN.CLIP_GRAD)
+    if clip_grad <= 0:
+        clip_grad = None
+    return Stage1TrainRuntime(
+        optimizer=optimizer,
+        lr_scheduler=lr_scheduler,
+        loss_scaler=NativeScalerWithGradNormCount(),
+        amp_enabled=bool(config.AMP_ENABLE and torch.cuda.is_available()),
+        clip_grad=clip_grad,
+    )
+
+
+def stage1_optimizer_step(
+    runtime: Stage1TrainRuntime,
+    loss: torch.Tensor,
+    model: nn.Module,
+    execution_context: Optional[Dict] = None,
+):
+    ensure_finite_tensor(loss, "total_loss", execution_context)
+    grad_norm = runtime.loss_scaler(
+        loss,
+        runtime.optimizer,
+        clip_grad=runtime.clip_grad,
+        parameters=model.parameters(),
+    )
+    if grad_norm is not None:
+        ensure_finite_tensor(grad_norm, "grad_norm", execution_context)
+    ensure_finite_number(runtime.loss_scale, "loss_scale", execution_context, positive=True)
+    runtime.lr_scheduler.step_update(runtime.global_step)
+    runtime.global_step += 1
+    runtime.optimizer.zero_grad()
+    return grad_norm
 
 
 def group_to_key(group: Sequence[str]) -> str:
@@ -434,8 +660,55 @@ def maybe_load_affinity_result_from_existing_artifacts(config: CN, output_root: 
     ]
     warmup_checkpoint = torch.load(warmup_checkpoint_path, map_location="cpu")
     post_affinity_checkpoint = torch.load(post_affinity_checkpoint_path, map_location="cpu")
+    post_extra_state = post_affinity_checkpoint.get("extra_state", {})
+    runtime_schema_version = int(post_extra_state.get("stage1_runtime_schema_version", 0))
+    if runtime_schema_version != STAGE1_RUNTIME_SCHEMA_VERSION:
+        raise RuntimeError(
+            "Refusing to resume legacy Stage-1 affinity artifacts without the "
+            f"numerical-stability contract (found schema={runtime_schema_version}, "
+            f"required={STAGE1_RUNTIME_SCHEMA_VERSION}). Start a clean Stage-1 run "
+            "from the original backbone checkpoint."
+        )
+    if not isinstance(post_extra_state.get("amp_smoke_test"), dict):
+        raise RuntimeError(
+            "Refusing to resume Stage-1 artifacts that do not record a passed AMP smoke test."
+        )
+    ensure_finite_model_state(
+        warmup_checkpoint["model"],
+        {"phase": "resume_artifact_validation", "checkpoint": warmup_checkpoint_path},
+    )
+    ensure_finite_model_state(
+        post_affinity_checkpoint["model"],
+        {"phase": "resume_artifact_validation", "checkpoint": post_affinity_checkpoint_path},
+    )
+    matrices_to_validate = [("directed_affinity", directed_affinity)]
+    matrices_to_validate.extend(
+        (f"directed_affinity_by_stage.{stage_idx}", matrix)
+        for stage_idx, matrix in enumerate(directed_affinity_by_stage)
+    )
+    matrices_to_validate.extend(
+        (f"affinity_epoch_history.{epoch_idx}", matrix)
+        for epoch_idx, matrix in enumerate(affinity_epoch_history)
+    )
+    for matrix_name, matrix in matrices_to_validate:
+        if not bool(np.isfinite(matrix).all()):
+            raise Stage1NumericalError(
+                f"Non-finite resumed Stage-1 artifact detected: {matrix_name}",
+                details={
+                    "phase": "resume_artifact_validation",
+                    "artifact_name": matrix_name,
+                },
+            )
+    for loss_group in ["warmup_validation_losses", "post_affinity_validation_losses"]:
+        for task, value in affinity_payload.get(loss_group, {}).items():
+            ensure_finite_number(
+                value,
+                f"{loss_group}.{task}",
+                {"phase": "resume_artifact_validation", "task": task},
+            )
     logger.info(
-        "Resuming Stage-1 from existing affinity artifacts | affinity_json=%s | post_affinity_checkpoint=%s",
+        "Resuming validated Stage-1 affinity artifacts | runtime_schema=%d | affinity_json=%s | post_affinity_checkpoint=%s",
+        runtime_schema_version,
         affinity_json_path,
         post_affinity_checkpoint_path,
     )
@@ -689,7 +962,16 @@ def build_task_model(config: CN, device: torch.device, logger, init_state_dict: 
     return model
 
 
-def evaluate_task_losses(model, data_loader, loss_ft, tasks, device: torch.device, max_batches: int = None):
+def evaluate_task_losses(
+    model,
+    data_loader,
+    loss_ft,
+    tasks,
+    device: torch.device,
+    max_batches: int = None,
+    amp_enabled: bool = False,
+    execution_context: Optional[Dict] = None,
+):
     model.eval()
     aggregated = {task: 0.0 for task in tasks}
     num_batches = 0
@@ -698,13 +980,93 @@ def evaluate_task_losses(model, data_loader, loss_ft, tasks, device: torch.devic
             if max_batches is not None and batch_idx >= max_batches:
                 break
             samples, targets = move_batch_to_device(batch, tasks, device)
-            outputs = model(samples)
-            for task in tasks:
-                aggregated[task] += float(loss_ft[task](outputs[task], targets[task]).item())
+            batch_context = update_stage1_execution_context(
+                execution_context,
+                batch=batch_idx,
+                sample_ids=get_batch_sample_ids(batch),
+                valid_label_ratios=get_target_valid_ratios(targets),
+            )
+            with torch.cuda.amp.autocast(enabled=bool(amp_enabled)):
+                outputs = model(samples)
+                task_losses = {
+                    task: loss_ft[task](outputs[task], targets[task])
+                    for task in tasks
+                }
+            ensure_finite_outputs(outputs, batch_context)
+            for task, task_loss in task_losses.items():
+                ensure_finite_tensor(
+                    task_loss,
+                    f"task_losses.{task}",
+                    update_stage1_execution_context(dict(batch_context), task=task),
+                )
+                aggregated[task] += float(task_loss.item())
             num_batches += 1
     if num_batches == 0:
         return {task: 0.0 for task in tasks}
     return {task: value / float(num_batches) for task, value in aggregated.items()}
+
+
+def run_stage1_amp_smoke_test(
+    model: nn.Module,
+    batch,
+    criterion,
+    tasks: Sequence[str],
+    device: torch.device,
+    amp_enabled: bool,
+    execution_context: Optional[Dict] = None,
+) -> Dict:
+    """Exercise a train-mode forward/backward without mutating the saved state."""
+    snapshot = clone_state_dict_to_cpu(model)
+    was_training = model.training
+    context = update_stage1_execution_context(
+        execution_context,
+        phase="post_affinity_amp_smoke",
+        sample_ids=get_batch_sample_ids(batch),
+    )
+    try:
+        model.train()
+        samples, targets = move_batch_to_device(batch, tasks, device)
+        context = update_stage1_execution_context(
+            context,
+            valid_label_ratios=get_target_valid_ratios(targets),
+        )
+        with torch.cuda.amp.autocast(enabled=bool(amp_enabled)):
+            outputs = model(samples)
+            loss, loss_dict = criterion(outputs, targets)
+
+        ensure_finite_outputs(outputs, context)
+        for task in tasks:
+            ensure_finite_tensor(
+                loss_dict[task],
+                f"task_losses.{task}",
+                update_stage1_execution_context(dict(context), task=task),
+            )
+        ensure_finite_tensor(loss, "total_loss", context)
+
+        trainable = [parameter for parameter in model.parameters() if parameter.requires_grad]
+        gradients = torch.autograd.grad(loss, trainable, allow_unused=True)
+        checked_gradients = 0
+        for parameter_idx, gradient in enumerate(gradients):
+            if gradient is None:
+                continue
+            ensure_finite_tensor(gradient, f"gradients.{parameter_idx}", context)
+            checked_gradients += 1
+        ensure_finite_model_state(model, context)
+        return {
+            "amp_enabled": bool(amp_enabled),
+            "loss": float(loss.item()),
+            "task_losses": {
+                task: float(loss_dict[task].item())
+                for task in tasks
+            },
+            "checked_gradients": checked_gradients,
+            "sample_ids": list(context.get("sample_ids", [])),
+            "valid_label_ratios": dict(context.get("valid_label_ratios", {})),
+        }
+    finally:
+        model.load_state_dict(snapshot, strict=True)
+        model.train(was_training)
+        model.zero_grad(set_to_none=True)
 
 
 def short_train_model(
@@ -859,7 +1221,17 @@ def build_pseudo_update(flat_grad: torch.Tensor, optimizer) -> torch.Tensor:
     return lr * (flat_grad + momentum * momentum_buffer)
 
 
-def warmup_and_collect_affinity(config: CN, logger, working_dir: str, data_split_manifest: Dict = None):
+def warmup_and_collect_affinity(
+    config: CN,
+    logger,
+    working_dir: str,
+    data_split_manifest: Dict = None,
+    execution_context: Optional[Dict] = None,
+):
+    execution_context = update_stage1_execution_context(
+        execution_context,
+        phase="stage1_initialization",
+    )
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     partition_granularity = get_partition_granularity(config)
     num_stages = len(config.MODEL.SWIN.DEPTHS)
@@ -869,12 +1241,19 @@ def warmup_and_collect_affinity(config: CN, logger, working_dir: str, data_split
     )
     model = build_task_model(config, device, logger)
     criterion, loss_ft, _ = build_loss_bundle(config)
-    optimizer = build_optimizer(config, model)
     num_train_batches = safe_num_batches(data_loader_train)
     num_val_batches = safe_num_batches(data_loader_val)
     train_log_interval = resolve_log_interval(num_train_batches)
     warmup_epochs = get_affinity_warmup_epochs(config)
     affinity_score_epochs = get_affinity_score_epochs(config)
+    runtime = build_stage1_train_runtime(
+        config,
+        model,
+        steps_per_epoch=num_train_batches,
+        warmup_epochs=warmup_epochs,
+        total_epochs=warmup_epochs + affinity_score_epochs,
+    )
+    optimizer = runtime.optimizer
     selection_train_label = get_selection_train_label(config, data_split_manifest)
     selection_eval_label = get_selection_eval_label(config, data_split_manifest)
     selection_loss_label = selection_eval_label.replace(" ", "_").replace("-", "_")
@@ -882,7 +1261,7 @@ def warmup_and_collect_affinity(config: CN, logger, working_dir: str, data_split
     meta_split_path = None if data_split_manifest is None else data_split_manifest.get("meta_split_path")
 
     logger.info(
-        "Stage-1 Step A start | tasks=%s | warmup_epochs=%d | affinity_score_epochs=%d | train_split=%s | selection_eval=%s | train_batches=%d | selection_batches=%d | output=%s",
+        "Stage-1 Step A start | tasks=%s | warmup_epochs=%d | affinity_score_epochs=%d | train_split=%s | selection_eval=%s | train_batches=%d | selection_batches=%d | base_lr=%.10g | amp=%s | clip_grad=%s | output=%s",
         list(config.TASKS),
         warmup_epochs,
         affinity_score_epochs,
@@ -890,37 +1269,100 @@ def warmup_and_collect_affinity(config: CN, logger, working_dir: str, data_split
         selection_eval_label,
         num_train_batches,
         num_val_batches,
+        float(config.TRAIN.BASE_LR),
+        runtime.amp_enabled,
+        runtime.clip_grad,
         working_dir,
     )
 
     if warmup_epochs > 0:
         for epoch_idx in range(warmup_epochs):
+            execution_context = update_stage1_execution_context(
+                execution_context,
+                phase="warmup",
+                epoch=epoch_idx,
+            )
             logger.info("Warmup epoch %d/%d started", epoch_idx + 1, warmup_epochs)
             model.train()
+            optimizer.zero_grad()
             for batch_idx, batch in enumerate(data_loader_train, start=1):
                 samples, targets = move_batch_to_device(batch, config.TASKS, device)
-                outputs = model(samples)
-                loss, _ = criterion(outputs, targets)
-                optimizer.zero_grad()
-                loss.backward()
-                optimizer.step()
+                execution_context = update_stage1_execution_context(
+                    execution_context,
+                    batch=batch_idx - 1,
+                    sample_ids=get_batch_sample_ids(batch),
+                    valid_label_ratios=get_target_valid_ratios(targets),
+                    learning_rate=runtime.learning_rate,
+                    loss_scale=runtime.loss_scale,
+                )
+                with torch.cuda.amp.autocast(enabled=runtime.amp_enabled):
+                    outputs = model(samples)
+                    loss, loss_dict = criterion(outputs, targets)
+                execution_context = update_stage1_execution_context(
+                    execution_context,
+                    task_losses={
+                        task: float(loss_dict[task].detach().float().item())
+                        for task in config.TASKS
+                    },
+                    total_loss=float(loss.detach().float().item()),
+                )
+                ensure_finite_outputs(outputs, execution_context)
+                for task in config.TASKS:
+                    ensure_finite_tensor(
+                        loss_dict[task],
+                        f"task_losses.{task}",
+                        update_stage1_execution_context(dict(execution_context), task=task),
+                    )
+                grad_norm = stage1_optimizer_step(runtime, loss, model, execution_context)
                 maybe_log_progress(
                     logger,
                     f"Warmup epoch {epoch_idx + 1}/{warmup_epochs}",
                     batch_idx,
                     num_train_batches,
                     train_log_interval,
-                    extra=f"loss={float(loss.item()):.6f}",
+                    extra=(
+                        f"loss={float(loss.item()):.6f} | "
+                        f"task_losses={round_value_map({task: value.item() for task, value in loss_dict.items() if task != 'total'})} | "
+                        f"lr={runtime.learning_rate:.10g} | grad_norm={float(grad_norm):.6f} | "
+                        f"loss_scale={runtime.loss_scale:.6f}"
+                    ),
                 )
+            last_good_path = save_stage1_last_good_checkpoint(
+                working_dir,
+                model,
+                runtime,
+                phase="warmup",
+                epoch=epoch_idx,
+            )
+            logger.info("Stage-1 last-good checkpoint updated: %s", last_good_path)
     else:
         logger.info("Warmup is skipped because AFFINITY_WARMUP_EPOCHS=%d", warmup_epochs)
 
-    warmup_validation_losses = evaluate_task_losses(model, data_loader_val, loss_ft, config.TASKS, device)
+    execution_context = update_stage1_execution_context(
+        execution_context,
+        phase="warmup_validation",
+        epoch=max(warmup_epochs - 1, 0),
+    )
+    warmup_validation_losses = evaluate_task_losses(
+        model,
+        data_loader_val,
+        loss_ft,
+        config.TASKS,
+        device,
+        amp_enabled=runtime.amp_enabled,
+        execution_context=execution_context,
+    )
+    for task, value in warmup_validation_losses.items():
+        ensure_finite_number(
+            value,
+            f"warmup_validation_losses.{task}",
+            update_stage1_execution_context(dict(execution_context), task=task),
+        )
+    ensure_finite_model_state(model, execution_context)
     warmup_state_dict = clone_state_dict_to_cpu(model)
 
     warmup_checkpoint_path = os.path.join(working_dir, "warmup_checkpoint.pth")
-    mkdir_if_missing(os.path.dirname(warmup_checkpoint_path))
-    torch.save(
+    atomic_torch_save(
         {
             "model": warmup_state_dict,
             "epoch": max(0, warmup_epochs - 1),
@@ -932,6 +1374,7 @@ def warmup_and_collect_affinity(config: CN, logger, working_dir: str, data_split
                 "partition_granularity": partition_granularity,
                 "selection_data_split_mode": selection_data_split_mode,
                 "meta_split_path": meta_split_path,
+                "stage1_runtime_schema_version": STAGE1_RUNTIME_SCHEMA_VERSION,
             },
         },
         warmup_checkpoint_path,
@@ -966,6 +1409,11 @@ def warmup_and_collect_affinity(config: CN, logger, working_dir: str, data_split
         logger.info("Affinity score collection is skipped because AFFINITY_SCORE_EPOCHS=0")
 
     for affinity_epoch_idx in range(affinity_score_epochs):
+        execution_context = update_stage1_execution_context(
+            execution_context,
+            phase="affinity",
+            epoch=affinity_epoch_idx,
+        )
         logger.info("Affinity epoch %d/%d started", affinity_epoch_idx + 1, affinity_score_epochs)
         epoch_directed_sum = torch.zeros((len(config.TASKS), len(config.TASKS)), dtype=torch.float32, device=device)
         epoch_directed_sum_by_stage = None
@@ -976,15 +1424,36 @@ def warmup_and_collect_affinity(config: CN, logger, working_dir: str, data_split
             ]
         epoch_batches = 0
         model.train()
+        optimizer.zero_grad()
         for batch_idx, batch in enumerate(data_loader_train, start=1):
             samples, targets = move_batch_to_device(batch, config.TASKS, device)
-            optimizer.zero_grad()
-            outputs = model(samples)
+            execution_context = update_stage1_execution_context(
+                execution_context,
+                batch=batch_idx - 1,
+                sample_ids=get_batch_sample_ids(batch),
+                valid_label_ratios=get_target_valid_ratios(targets),
+                learning_rate=runtime.learning_rate,
+                loss_scale=runtime.loss_scale,
+            )
+            with torch.cuda.amp.autocast(enabled=runtime.amp_enabled):
+                outputs = model(samples)
+                loss, loss_dict = criterion(outputs, targets)
+            execution_context = update_stage1_execution_context(
+                execution_context,
+                task_losses={
+                    task: float(loss_dict[task].detach().float().item())
+                    for task in config.TASKS
+                },
+                total_loss=float(loss.detach().float().item()),
+            )
+            ensure_finite_outputs(outputs, execution_context)
 
             flat_gradients = {}
             pseudo_updates = {}
             for task in config.TASKS:
-                task_loss = loss_ft[task](outputs[task], targets[task])
+                task_loss = loss_dict[task]
+                task_context = update_stage1_execution_context(dict(execution_context), task=task)
+                ensure_finite_tensor(task_loss, f"task_losses.{task}", task_context)
                 grads = torch.autograd.grad(
                     task_loss,
                     shared_params,
@@ -992,8 +1461,10 @@ def warmup_and_collect_affinity(config: CN, logger, working_dir: str, data_split
                     allow_unused=True,
                 )
                 flat_grad = flatten_gradient_list(shared_params, grads)
+                ensure_finite_tensor(flat_grad, f"flat_gradients.{task}", task_context)
                 flat_gradients[task] = flat_grad
                 pseudo_updates[task] = build_pseudo_update(flat_grad, optimizer)
+                ensure_finite_tensor(pseudo_updates[task], f"pseudo_updates.{task}", task_context)
 
             lr = float(optimizer.param_groups[0]["lr"])
             for src_task in config.TASKS:
@@ -1001,6 +1472,11 @@ def warmup_and_collect_affinity(config: CN, logger, working_dir: str, data_split
                 for dst_task in config.TASKS:
                     dst_idx = task_index[dst_task]
                     dot_value = torch.dot(flat_gradients[dst_task], pseudo_updates[src_task])
+                    ensure_finite_tensor(
+                        dot_value,
+                        f"affinity_dot.{src_task}.{dst_task}",
+                        execution_context,
+                    )
                     epoch_directed_sum[src_idx, dst_idx] += dot_value / max(lr, 1e-12)
                     if epoch_directed_sum_by_stage is not None:
                         for stage_idx, flat_slices in enumerate(shared_param_stage_slices):
@@ -1014,16 +1490,19 @@ def warmup_and_collect_affinity(config: CN, logger, working_dir: str, data_split
                             )
             epoch_batches += 1
 
-            loss, _ = criterion(outputs, targets)
-            loss.backward()
-            optimizer.step()
+            grad_norm = stage1_optimizer_step(runtime, loss, model, execution_context)
             maybe_log_progress(
                 logger,
                 f"Affinity epoch {affinity_epoch_idx + 1}/{affinity_score_epochs}",
                 batch_idx,
                 num_train_batches,
                 train_log_interval,
-                extra=f"loss={float(loss.item()):.6f}",
+                extra=(
+                    f"loss={float(loss.item()):.6f} | "
+                    f"task_losses={round_value_map({task: value.item() for task, value in loss_dict.items() if task != 'total'})} | "
+                    f"lr={runtime.learning_rate:.10g} | grad_norm={float(grad_norm):.6f} | "
+                    f"loss_scale={runtime.loss_scale:.6f}"
+                ),
             )
 
         epoch_directed_affinity = (epoch_directed_sum / max(float(epoch_batches), 1.0)).detach().cpu().numpy()
@@ -1048,6 +1527,15 @@ def warmup_and_collect_affinity(config: CN, logger, working_dir: str, data_split
             epoch_batches,
             round_value_map(epoch_matrix_stats),
         )
+        ensure_finite_tensor(epoch_directed_sum, "epoch_directed_sum", execution_context)
+        last_good_path = save_stage1_last_good_checkpoint(
+            working_dir,
+            model,
+            runtime,
+            phase="affinity",
+            epoch=affinity_epoch_idx,
+        )
+        logger.info("Stage-1 last-good checkpoint updated: %s", last_good_path)
 
     if affinity_epoch_history:
         directed_affinity = np.mean(np.stack(affinity_epoch_history, axis=0), axis=0)
@@ -1069,10 +1557,48 @@ def warmup_and_collect_affinity(config: CN, logger, working_dir: str, data_split
     else:
         directed_affinity_by_stage = []
     symmetric_affinity = 0.5 * (directed_affinity + directed_affinity.T)
-    post_affinity_validation_losses = evaluate_task_losses(model, data_loader_val, loss_ft, config.TASKS, device)
+    execution_context = update_stage1_execution_context(
+        execution_context,
+        phase="post_affinity_validation",
+        epoch=max(affinity_score_epochs - 1, 0),
+    )
+    post_affinity_validation_losses = evaluate_task_losses(
+        model,
+        data_loader_val,
+        loss_ft,
+        config.TASKS,
+        device,
+        amp_enabled=runtime.amp_enabled,
+        execution_context=execution_context,
+    )
+    for task, value in post_affinity_validation_losses.items():
+        ensure_finite_number(
+            value,
+            f"post_affinity_validation_losses.{task}",
+            update_stage1_execution_context(dict(execution_context), task=task),
+        )
+    ensure_finite_model_state(model, execution_context)
     post_affinity_state_dict = clone_state_dict_to_cpu(model)
+    try:
+        smoke_batch = next(iter(data_loader_train))
+    except StopIteration as exc:
+        raise Stage1NumericalError(
+            "Stage-1 AMP smoke test requires at least one training batch.",
+            details=dict(execution_context),
+        ) from exc
+    smoke_result = run_stage1_amp_smoke_test(
+        model,
+        smoke_batch,
+        criterion,
+        config.TASKS,
+        device,
+        runtime.amp_enabled,
+        execution_context=execution_context,
+    )
+    logger.info("Stage-1 post-affinity AMP smoke test passed: %s", smoke_result)
+    ensure_finite_model_state(post_affinity_state_dict, execution_context)
     post_affinity_checkpoint_path = os.path.join(working_dir, "post_affinity_checkpoint.pth")
-    torch.save(
+    atomic_torch_save(
         {
             "model": post_affinity_state_dict,
             "epoch": max(0, warmup_epochs + affinity_score_epochs - 1) if (warmup_epochs + affinity_score_epochs) > 0 else 0,
@@ -1084,6 +1610,8 @@ def warmup_and_collect_affinity(config: CN, logger, working_dir: str, data_split
                 "partition_granularity": partition_granularity,
                 "selection_data_split_mode": selection_data_split_mode,
                 "meta_split_path": meta_split_path,
+                "amp_smoke_test": smoke_result,
+                "stage1_runtime_schema_version": STAGE1_RUNTIME_SCHEMA_VERSION,
             },
         },
         post_affinity_checkpoint_path,
@@ -1541,6 +2069,7 @@ def write_search_artifacts(
         save_stage_partition_csv(ranked_partitions_by_stage, artifact_paths["partition_results_csv"])
 
         grouping_payload = {
+            "stage1_runtime_schema_version": STAGE1_RUNTIME_SCHEMA_VERSION,
             "tasks": list(tasks),
             "partition_granularity": partition_granularity,
             "group_slot_names": group_slot_names,
@@ -1610,6 +2139,7 @@ def write_search_artifacts(
         )
         task_to_group = build_task_to_group(best_partition["groups"])
         grouping_payload = {
+            "stage1_runtime_schema_version": STAGE1_RUNTIME_SCHEMA_VERSION,
             "tasks": list(tasks),
             "partition_granularity": partition_granularity,
             "groups": best_partition["groups"],
@@ -1762,6 +2292,13 @@ def replay_stage1_partition_search(
     )
     if partition_granularity == "stage" and search_score_source != "group_proxy":
         raise ValueError("Stage-wise replay search only supports search_score_source='group_proxy'.")
+    runtime_schema_version = int(grouping_payload.get("stage1_runtime_schema_version", 0))
+    if runtime_schema_version != STAGE1_RUNTIME_SCHEMA_VERSION:
+        raise RuntimeError(
+            "Refusing to replay legacy Stage-1 search artifacts without the "
+            f"numerical-stability contract (found schema={runtime_schema_version}, "
+            f"required={STAGE1_RUNTIME_SCHEMA_VERSION})."
+        )
 
     score_file_path = (
         group_proxy_json_path
@@ -1899,7 +2436,18 @@ def replay_stage1_partition_search(
     }
 
 
-def run_stage1_pipeline(config: CN, output_root: str, logger, base_cfg_path: str):
+def run_stage1_pipeline(
+    config: CN,
+    output_root: str,
+    logger,
+    base_cfg_path: str,
+    execution_context: Optional[Dict] = None,
+):
+    execution_context = update_stage1_execution_context(
+        execution_context,
+        phase="pipeline_initialization",
+        output_root=os.path.abspath(output_root),
+    )
     mkdir_if_missing(output_root)
     logger.info("AG-MTLoRA Stage-1 pipeline started | output_root=%s", output_root)
     data_split_manifest = build_stage1_data_split_manifest(config, logger)
@@ -1915,6 +2463,7 @@ def run_stage1_pipeline(config: CN, output_root: str, logger, base_cfg_path: str
             logger,
             output_root,
             data_split_manifest=data_split_manifest,
+            execution_context=execution_context,
         )
     directed_affinity = affinity_result["directed_affinity"]
     directed_affinity_by_stage = affinity_result.get("directed_affinity_by_stage", [])
@@ -1931,6 +2480,7 @@ def run_stage1_pipeline(config: CN, output_root: str, logger, base_cfg_path: str
 
     save_json(
         {
+            "stage1_runtime_schema_version": STAGE1_RUNTIME_SCHEMA_VERSION,
             "tasks": list(config.TASKS),
             "partition_granularity": partition_granularity,
             "selection_data_split_mode": selection_data_split_mode,

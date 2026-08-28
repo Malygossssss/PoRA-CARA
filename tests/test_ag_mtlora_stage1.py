@@ -14,6 +14,8 @@ from yacs.config import CfgNode as CN
 import ag_mtlora.stage1 as stage1
 import config as config_module
 import models.swin_transformer_mtlora as swin_mtlora_module
+from mtl_loss_schemes import SoftMaxwithLoss
+from utils import scale_learning_rates
 
 
 class FakeDataset:
@@ -46,6 +48,22 @@ class FakePromptTaskModel(nn.Module):
         super().__init__()
         self.backbone = FakePromptBackbone()
         self.decoder = nn.Linear(1, 1)
+
+
+class SmokeTestModel(nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.norm = nn.BatchNorm2d(1)
+        self.head = nn.Conv2d(1, 1, kernel_size=1)
+
+    def forward(self, image):
+        return {"task_a": self.head(self.norm(image))}
+
+
+class SmokeTestCriterion(nn.Module):
+    def forward(self, outputs, targets):
+        task_loss = (outputs["task_a"] - targets["task_a"]).square().mean()
+        return task_loss, {"task_a": task_loss, "total": task_loss}
 
 
 def build_stage1_config(tmpdir, split_mode="train_meta_strict"):
@@ -109,6 +127,103 @@ def build_update_config_args(cfg_path, tmpdir, tasks="task_a,task_b"):
 
 
 class Stage1MetaSplitTest(unittest.TestCase):
+    def test_nonfinite_guard_reports_tensor_and_training_context(self):
+        context = {"phase": "warmup", "epoch": 2, "batch": 17, "task": "normals"}
+
+        with self.assertRaises(stage1.Stage1NumericalError) as raised:
+            stage1.ensure_finite_tensor(
+                torch.tensor([1.0, float("nan")]),
+                "task_losses.normals",
+                context,
+            )
+
+        self.assertEqual(raised.exception.details["phase"], "warmup")
+        self.assertEqual(raised.exception.details["epoch"], 2)
+        self.assertEqual(raised.exception.details["batch"], 17)
+        self.assertEqual(raised.exception.details["tensor_name"], "task_losses.normals")
+        self.assertEqual(raised.exception.details["tensor_stats"]["nonfinite_count"], 1)
+
+    def test_amp_smoke_test_restores_batchnorm_state_and_mode(self):
+        model = SmokeTestModel()
+        model.eval()
+        state_before = {
+            name: tensor.detach().clone()
+            for name, tensor in model.state_dict().items()
+        }
+        batch = {
+            "image": torch.randn(2, 1, 4, 4),
+            "task_a": torch.randn(2, 1, 4, 4),
+            "meta": {"image": ["sample_a", "sample_b"]},
+        }
+
+        result = stage1.run_stage1_amp_smoke_test(
+            model,
+            batch,
+            SmokeTestCriterion(),
+            ["task_a"],
+            torch.device("cpu"),
+            amp_enabled=False,
+        )
+
+        self.assertFalse(model.training)
+        self.assertGreater(result["checked_gradients"], 0)
+        self.assertEqual(result["sample_ids"], ["sample_a", "sample_b"])
+        for name, tensor_before in state_before.items():
+            self.assertTrue(torch.equal(model.state_dict()[name], tensor_before), name)
+
+    def test_scale_learning_rates_matches_formal_training_and_rejects_double_scaling(self):
+        config = CN()
+        config.DATA = CN()
+        config.DATA.BATCH_SIZE = 9
+        config.TRAIN = CN()
+        config.TRAIN.BASE_LR = 1.0e-3
+        config.TRAIN.WARMUP_LR = 1.0e-6
+        config.TRAIN.MIN_LR = 1.0e-5
+        config.TRAIN.ACCUMULATION_STEPS = 1
+        config.TRAIN.LR_SCALED = False
+        config.freeze()
+
+        scaled = scale_learning_rates(config, world_size=1)
+
+        self.assertAlmostEqual(config.TRAIN.BASE_LR, 1.7578125e-5)
+        self.assertAlmostEqual(config.TRAIN.WARMUP_LR, 1.7578125e-8)
+        self.assertAlmostEqual(config.TRAIN.MIN_LR, 1.7578125e-7)
+        self.assertEqual(scaled["global_batch_size"], 9)
+        self.assertTrue(config.TRAIN.LR_SCALED)
+        with self.assertRaisesRegex(RuntimeError, "already been scaled"):
+            scale_learning_rates(config, world_size=1)
+
+    def test_softmax_loss_returns_differentiable_zero_for_all_ignored_batch(self):
+        output = torch.randn(2, 7, 4, 4, requires_grad=True)
+        target = torch.full((2, 1, 4, 4), 255, dtype=torch.long)
+
+        loss = SoftMaxwithLoss(ignore_index=255)(output, target)
+
+        self.assertTrue(torch.isfinite(loss))
+        self.assertEqual(float(loss.item()), 0.0)
+        loss.backward()
+        self.assertIsNotNone(output.grad)
+        self.assertTrue(torch.isfinite(output.grad).all())
+        self.assertEqual(int(torch.count_nonzero(output.grad).item()), 0)
+
+    def test_stage1_scheduler_uses_search_duration_and_affinity_warmup(self):
+        config = CN()
+        config.TRAIN = CN()
+        config.TRAIN.EPOCHS = 300
+        config.TRAIN.WARMUP_EPOCHS = 20
+        config.freeze()
+
+        scheduler_config = stage1.build_stage1_scheduler_config(
+            config,
+            warmup_epochs=5,
+            total_epochs=55,
+        )
+
+        self.assertEqual(scheduler_config.TRAIN.EPOCHS, 55)
+        self.assertEqual(scheduler_config.TRAIN.WARMUP_EPOCHS, 5)
+        self.assertEqual(config.TRAIN.EPOCHS, 300)
+        self.assertEqual(config.TRAIN.WARMUP_EPOCHS, 20)
+
     def test_build_task_model_keeps_prompt_trainable_for_stage1_optimizer(self):
         config = CN()
         config.MTL = False
@@ -1082,6 +1197,7 @@ class Stage1MetaSplitTest(unittest.TestCase):
 
             original_ranked_partitions = stage1.run_partition_search(tasks, final_predictions, max_groups=2)
             original_grouping_payload = {
+                "stage1_runtime_schema_version": stage1.STAGE1_RUNTIME_SCHEMA_VERSION,
                 "tasks": tasks,
                 "groups": [["task_a"], ["task_b"]],
                 "task_to_group": {"task_a": "group_0", "task_b": "group_1"},

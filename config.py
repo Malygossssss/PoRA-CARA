@@ -205,6 +205,8 @@ _C.TRAIN.BASE_LR = 5e-4
 # _C.TRAIN.BASE_LR = 5e-5
 _C.TRAIN.WARMUP_LR = 5e-7
 _C.TRAIN.MIN_LR = 5e-6
+# Runtime guard: launchers must scale the configured learning rates exactly once.
+_C.TRAIN.LR_SCALED = False
 # Clip gradient norm
 _C.TRAIN.CLIP_GRAD = 5.0
 # Auto resume from latest checkpoint

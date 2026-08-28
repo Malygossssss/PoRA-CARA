@@ -5,6 +5,7 @@ import random
 from typing import Dict, Iterable, List, Sequence, Tuple
 
 DEFAULT_PARTITION_GRANULARITY = "global"
+STAGE1_RUNTIME_SCHEMA_VERSION = 2
 SUPPORTED_PARTITION_GRANULARITIES = {"global", "stage"}
 
 
@@ -90,6 +91,16 @@ def _validate_groups_cover_tasks(
 def load_grouping_json(grouping_json_path: str, expected_tasks: Sequence[str]) -> Dict:
     with open(grouping_json_path, "r", encoding="utf-8") as handle:
         payload = json.load(handle)
+
+    if payload.get("post_affinity_checkpoint"):
+        runtime_schema_version = int(payload.get("stage1_runtime_schema_version", 0))
+        if runtime_schema_version != STAGE1_RUNTIME_SCHEMA_VERSION:
+            raise ValueError(
+                "Refusing to use a legacy Stage-1 grouping without the numerical-stability "
+                f"contract (found schema={runtime_schema_version}, "
+                f"required={STAGE1_RUNTIME_SCHEMA_VERSION}). Rerun Stage-1 from the original "
+                "backbone checkpoint."
+            )
 
     partition_granularity = normalize_partition_granularity(
         payload.get("partition_granularity", DEFAULT_PARTITION_GRANULARITY)

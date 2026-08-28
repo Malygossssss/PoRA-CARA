@@ -1,5 +1,10 @@
 # UniPoRA-CARA End-to-End 2lr Design
 
+> 2026-08-28 更正：下文关于 Stage1 直接使用未缩放固定
+> `BASE_LR`、没有 scheduler 的描述已经失效。Stage1 现在与正式训练共用
+> runtime LR 缩放，并在 5+50 epoch 上使用 warmup/cosine、AMP、GradScaler
+> 和梯度裁剪。修复前产物必须作废并从原始 Swin backbone 重跑。
+
 ## Goal
 
 让 PoRA-CARA 使用 UniPoRA 已验证的双倍学习率，同时保持旧实验可复现，并确保 Stage1 生成的 resolved config 自动把相同训练超参数传递到正式训练。

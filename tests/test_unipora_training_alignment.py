@@ -1,6 +1,10 @@
 import ast
+import json
+import tempfile
 import unittest
 from pathlib import Path
+
+from ag_mtlora.config_utils import load_grouping_json
 
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
@@ -28,6 +32,51 @@ def _call_name(call):
 
 
 class UniPoRATrainingAlignmentTests(unittest.TestCase):
+    def test_formal_training_rejects_legacy_stage1_grouping(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            grouping_path = Path(tmpdir) / "grouping.json"
+            grouping_path.write_text(
+                json.dumps({
+                    "tasks": ["task_a", "task_b"],
+                    "groups": [["task_a", "task_b"]],
+                    "post_affinity_checkpoint": "legacy_post_affinity_checkpoint.pth",
+                }),
+                encoding="utf-8",
+            )
+
+            with self.assertRaisesRegex(ValueError, "legacy Stage-1 grouping"):
+                load_grouping_json(str(grouping_path), ["task_a", "task_b"])
+
+    def test_main_and_stage1_share_the_learning_rate_scaler(self):
+        main_tree = _parse("main.py")
+        launcher_tree = _parse("scripts/ag_mtlora_stage1_prepare.py")
+
+        main_calls = {
+            _call_name(node)
+            for node in ast.walk(main_tree)
+            if isinstance(node, ast.Call)
+        }
+        launcher_calls = {
+            _call_name(node)
+            for node in ast.walk(launcher_tree)
+            if isinstance(node, ast.Call)
+        }
+
+        self.assertIn("scale_learning_rates", main_calls)
+        self.assertIn("scale_learning_rates", launcher_calls)
+
+    def test_stage1_resume_rejects_legacy_unvalidated_artifacts(self):
+        source = (PROJECT_ROOT / "ag_mtlora/stage1.py").read_text(encoding="utf-8")
+        config_utils_source = (PROJECT_ROOT / "ag_mtlora/config_utils.py").read_text(
+            encoding="utf-8"
+        )
+
+        self.assertIn("STAGE1_RUNTIME_SCHEMA_VERSION = 2", config_utils_source)
+        self.assertIn("Refusing to resume legacy Stage-1 affinity artifacts", source)
+        self.assertIn('post_extra_state.get("amp_smoke_test")', source)
+        self.assertIn("resume_artifact_validation", source)
+        self.assertIn("Refusing to use a legacy Stage-1 grouping", config_utils_source)
+
     def test_main_uses_unipora_independent_process_semantics(self):
         tree = _parse("main.py")
         call_names = {

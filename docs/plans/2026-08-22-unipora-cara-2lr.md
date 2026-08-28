@@ -1,5 +1,10 @@
 # UniPoRA-CARA End-to-End 2lr Implementation Plan
 
+> Superseded on 2026-08-28: Stage1 no longer consumes raw `BASE_LR`
+> directly. It uses the shared runtime batch-size scaler and a warmup/cosine
+> scheduler. Stage1 artifacts produced before the numerical-stability fix are
+> invalid for Step-2 and must be regenerated from the original Swin backbone.
+
 > **For Claude:** REQUIRED SUB-SKILL: Use superpowers:executing-plans to implement this plan task-by-task.
 
 **Goal:** Add a reproducible PoRA-CARA configuration that applies UniPoRA's validated 2x learning rates to Stage1 and formal training.

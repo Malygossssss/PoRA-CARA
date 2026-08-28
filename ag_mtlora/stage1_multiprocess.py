@@ -7,6 +7,7 @@ from typing import Dict, Mapping, Optional
 MULTI_PROCESS_MODE = "unipora_independent_processes"
 RANK_ARTIFACT_MANIFEST = "stage1_artifacts.json"
 ROOT_MULTI_PROCESS_MANIFEST = "stage1_multi_process_manifest.json"
+FAILURE_REPORT = "failure_report.json"
 
 
 @dataclass(frozen=True)
@@ -123,6 +124,57 @@ def build_rank_artifact_manifest(
     }
 
 
+def get_failure_report_path(context: Stage1ProcessContext, paths: Stage1OutputPaths) -> str:
+    filename = FAILURE_REPORT if not context.is_multi_process else f"failure_report_rank{context.rank}.json"
+    return os.path.join(paths.rank_output_root, filename)
+
+
+def build_rank_failure_manifest(
+    context: Stage1ProcessContext,
+    paths: Stage1OutputPaths,
+    effective_seed: int,
+    failure_report_path: str,
+    error_type: str,
+    error_message: str,
+) -> Dict:
+    return {
+        "schema_version": 1,
+        "mode": MULTI_PROCESS_MODE if context.is_multi_process else "single_process",
+        "status": "failed",
+        "rank": context.rank,
+        "world_size": context.world_size,
+        "local_rank": context.local_rank,
+        "effective_seed": int(effective_seed),
+        "run_root": paths.run_root,
+        "rank_output_root": paths.rank_output_root,
+        "failure_report_path": failure_report_path,
+        "error_type": str(error_type),
+        "error_message": str(error_message),
+        "artifacts": {},
+    }
+
+
+def build_multi_process_failure_manifest(
+    context: Stage1ProcessContext,
+    paths: Stage1OutputPaths,
+    failure_report_path: str,
+    error_type: str,
+    error_message: str,
+) -> Dict:
+    if not context.is_primary or not context.is_multi_process:
+        raise ValueError("Only rank 0 may build the root Stage-1 failure manifest.")
+    return {
+        "schema_version": 1,
+        "mode": MULTI_PROCESS_MODE,
+        "status": "failed",
+        "world_size": context.world_size,
+        "failed_rank": context.rank,
+        "failure_report_path": failure_report_path,
+        "error_type": str(error_type),
+        "error_message": str(error_message),
+    }
+
+
 def build_multi_process_manifest(
     context: Stage1ProcessContext,
     paths: Stage1OutputPaths,
@@ -166,5 +218,9 @@ def write_manifest(payload: Dict, output_path: str) -> None:
         os.makedirs(output_dir, exist_ok=True)
     temporary_path = output_path + ".tmp"
     with open(temporary_path, "w", encoding="utf-8") as handle:
-        json.dump(payload, handle, indent=2, ensure_ascii=False)
+        json.dump(payload, handle, indent=2, ensure_ascii=False, allow_nan=False)
     os.replace(temporary_path, output_path)
+
+
+def write_failure_report(payload: Dict, output_path: str) -> None:
+    write_manifest(payload, output_path)

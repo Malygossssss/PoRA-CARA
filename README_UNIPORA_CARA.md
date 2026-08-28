@@ -70,8 +70,8 @@ AGMTLORA:
 
 - `semseg/normals/sal/human_parts: [0]` 会在配置解析时扩展成每个 Swin stage 都为 0。
 - `shared: [64]` 会扩展成每个 Swin stage 的 shared rank 都为 64。
-- Stage-1 直接使用固定的 `BASE_LR=1e-3`；它没有 scheduler，因此 `WARMUP_LR` 和 `MIN_LR` 在 Stage-1 不参与计算。
-- 正式训练会继承全部三个学习率字段，并继续按 batch size、`WORLD_SIZE` 和 accumulation steps 使用与 UniPoRA 一致的缩放及 scheduler。
+- YAML 中的 `BASE_LR=1e-3` 是原始实验值。Stage-1 和正式训练都会在运行时对 `BASE_LR/WARMUP_LR/MIN_LR` 只缩放一次，公式为 `batch_size * WORLD_SIZE * accumulation_steps / 512`。
+- Stage-1 的 5 个 warmup epoch 使用线性 warmup，后续 50 个 affinity epoch 使用 cosine decay；训练路径与正式训练一样启用 autocast、GradScaler 和 `CLIP_GRAD`。
 - Stage-1 搜索时还没有固定 group，因此使用的是普通 global shared LoRA。
 - 分组完成后，正式训练使用生成的 resolved config，代码会把 global shared LoRA 路由切换成 group-shared LoRA。
 
@@ -106,6 +106,8 @@ CUDA_VISIBLE_DEVICES=6,7 python -m torch.distributed.launch \
 
 2lr 是端到端实验配置，必须用它创建新的 Stage-1 run。不要通过 `--resume-stage1-dir` 复用旧学习率生成的 affinity/grouping，也不要把旧 `post_affinity_checkpoint.pth` 用作新的 2lr 正式训练初始化。
 
+尤其不要复用 2026-08-28 修复前生成的 Stage-1 产物：旧实现曾以未缩放的 `BASE_LR` 做固定学习率训练，且没有 AMP、scheduler、梯度裁剪和有限值验收。即使文件存在，也不能据此继续 Stage-2。
+
 这一步会发生以下事情：
 
 - `MODEL.PROMPT.ENABLED` 保持为 `True`，Stage-1 会构建并训练每个 task 独立的 prompt。
@@ -136,7 +138,17 @@ resolved_agmtlora_config__group_proxy.yaml
 resolved_agmtlora_runtime_snapshot__group_proxy.yaml
 warmup_checkpoint.pth
 post_affinity_checkpoint.pth
+last_good_checkpoint.pth
+stage1_artifacts.json
 ```
+
+成功条件是日志最后出现 `STAGE1_COMPLETED`，同时
+`stage1_artifacts.json` 的 `status` 为 `complete`。若检测到 NaN/Inf、异常
+gradient/state 或 AMP smoke test 失败，进程会以非零状态退出，日志出现
+`STAGE1_ABORTED`，并写入 `failure_report.json`（多进程为
+`failure_report_rankN.json`）、`status: failed` 的 manifest 和最近一个健康
+epoch 的 `last_good_checkpoint.pth`。失败 run 的 grouping 和
+`post_affinity_checkpoint.pth` 不可用于正式训练。
 
 双进程 Stage-1 会在共享 run 根目录下按 rank 隔离产物：
 
@@ -272,6 +284,8 @@ Stage-1 prepare 日志中应确认：
 - `MODEL.AGMTLORA.GROUPING_SOURCE: search`
 - `MODEL.AGMTLORA.SEARCH_SCORE_SOURCE: group_proxy`
 - 输出了 `grouping__group_proxy.json` 和 `resolved_agmtlora_config__group_proxy.yaml`。
+- `Runtime learning-rate scaling` 中的峰值 LR 符合当前 batch；例如单进程 batch 9 时，`BASE_LR=1e-3` 应缩放为 `1.7578125e-5`。
+- 最终标记为 `STAGE1_COMPLETED`，不存在 `STAGE1_ABORTED`。
 
 正式训练日志中应确认：
 

@@ -26,6 +26,7 @@ class SoftMaxwithLoss(Module):
 
     def __init__(self, ignore_index=255):
         super(SoftMaxwithLoss, self).__init__()
+        self.ignore_index = ignore_index
         self.softmax = nn.LogSoftmax(dim=1)
         self.criterion = nn.NLLLoss(ignore_index=ignore_index)
 
@@ -34,6 +35,11 @@ class SoftMaxwithLoss(Module):
         # out shape  batch_size x channels x h x w
         # label shape batch_size x 1 x h x w
         label = label[:, 0, :, :].long()
+        if not torch.any(label != self.ignore_index):
+            # NLLLoss(mean) is NaN when every target is ignored. Keep the zero
+            # connected to the prediction graph so distributed/task-wise
+            # backward paths remain valid and produce zero gradients.
+            return out.sum() * 0.0
         loss = self.criterion(self.softmax(out), label)
 
         return loss

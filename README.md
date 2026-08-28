@@ -124,6 +124,12 @@ Each rank performs a complete independent search with seed `SEED + rank` and
 writes to `run_<timestamp>/rank_<rank>/`. Rank 0 is canonical; use its resolved
 config and checkpoint for Step-2. No DDP, data sharding, gradient synchronization,
 or affinity averaging is performed. Single-process Stage-1 paths remain unchanged.
+Stage-1 applies the same runtime learning-rate scaling as `main.py`, then uses
+linear warmup/cosine decay, autocast, GradScaler, and gradient clipping. A run is
+valid only when its log ends with `STAGE1_COMPLETED` and its
+`stage1_artifacts.json` has `status: complete`. Failed runs end with
+`STAGE1_ABORTED` and persist `failure_report*.json` plus
+`last_good_checkpoint.pth`; do not pass their grouping or checkpoint to Step-2.
 
 ## Available Configs
 
@@ -149,7 +155,11 @@ Standard Swin baselines are kept under `configs/swin/`.
 
 AG-MTLoRA Stage-1 specific workflow, search configuration, replay-search usage, and the new stage-wise partition mode are documented in `README_AG_MTLORA_STAGE1.md`.
 
-The recommended end-to-end UniPoRA-CARA workflow uses the inherited `_2lr.yaml` config above. Stage-1 consumes its `BASE_LR=1e-3` directly, while formal training inherits all three learning-rate fields through the generated resolved config. See `README_UNIPORA_CARA.md`.
+The recommended end-to-end UniPoRA-CARA workflow uses the inherited `_2lr.yaml`
+config above. The YAML keeps the raw learning rates; both Stage-1 and formal
+training scale all three fields once at runtime using
+`batch_size * WORLD_SIZE * accumulation_steps / 512`. See
+`README_UNIPORA_CARA.md`.
 
 Stage-wise partition example configs:
 

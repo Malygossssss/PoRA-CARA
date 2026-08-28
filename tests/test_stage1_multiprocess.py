@@ -5,8 +5,11 @@ from unittest import mock
 
 from ag_mtlora.stage1_multiprocess import (
     Stage1ProcessContext,
+    build_multi_process_failure_manifest,
     build_multi_process_manifest,
+    build_rank_failure_manifest,
     build_rank_artifact_manifest,
+    get_failure_report_path,
     resolve_process_context,
     resolve_stage1_output_paths,
 )
@@ -122,6 +125,51 @@ class Stage1OutputPathTests(unittest.TestCase):
 
 
 class Stage1ManifestTests(unittest.TestCase):
+    def test_failure_manifest_points_to_rank_specific_report(self):
+        context = Stage1ProcessContext(rank=1, world_size=2, local_rank=1)
+        paths = resolve_stage1_output_paths(
+            config_output=str(PROJECT_ROOT / "output_for_test"),
+            context=context,
+            timestamp="20260828_120000",
+        )
+        failure_report_path = get_failure_report_path(context, paths)
+        manifest = build_rank_failure_manifest(
+            context=context,
+            paths=paths,
+            effective_seed=43,
+            failure_report_path=failure_report_path,
+            error_type="Stage1NumericalError",
+            error_message="non-finite total loss",
+        )
+
+        self.assertEqual(Path(failure_report_path).name, "failure_report_rank1.json")
+        self.assertEqual(manifest["status"], "failed")
+        self.assertEqual(manifest["rank"], 1)
+        self.assertEqual(manifest["effective_seed"], 43)
+        self.assertEqual(manifest["failure_report_path"], failure_report_path)
+        self.assertEqual(manifest["artifacts"], {})
+
+    def test_primary_rank_can_build_root_failure_manifest(self):
+        context = Stage1ProcessContext(rank=0, world_size=2, local_rank=0)
+        paths = resolve_stage1_output_paths(
+            config_output=str(PROJECT_ROOT / "output_for_test"),
+            context=context,
+            timestamp="20260828_120000",
+        )
+        failure_report_path = get_failure_report_path(context, paths)
+
+        manifest = build_multi_process_failure_manifest(
+            context=context,
+            paths=paths,
+            failure_report_path=failure_report_path,
+            error_type="RuntimeError",
+            error_message="boom",
+        )
+
+        self.assertEqual(manifest["status"], "failed")
+        self.assertEqual(manifest["failed_rank"], 0)
+        self.assertEqual(manifest["failure_report_path"], failure_report_path)
+
     def test_rank_zero_is_the_canonical_result(self):
         context = Stage1ProcessContext(rank=0, world_size=2, local_rank=0)
         paths = resolve_stage1_output_paths(
@@ -194,6 +242,19 @@ class Stage1LauncherContractTests(unittest.TestCase):
         source = (PROJECT_ROOT / "scripts/ag_mtlora_stage1_prepare.py").read_text(encoding="utf-8")
         self.assertIn('"--local_rank"', source)
         self.assertIn('"--local-rank"', source)
+
+    def test_launcher_persists_failures_and_emits_terminal_markers(self):
+        launcher_calls = _call_names("scripts/ag_mtlora_stage1_prepare.py")
+        source = (PROJECT_ROOT / "scripts/ag_mtlora_stage1_prepare.py").read_text(
+            encoding="utf-8"
+        )
+
+        self.assertIn("write_failure_report", launcher_calls)
+        self.assertIn("build_rank_failure_manifest", launcher_calls)
+        self.assertIn("logger.exception", source)
+        self.assertIn("STAGE1_ABORTED", source)
+        self.assertIn("STAGE1_COMPLETED", source)
+        self.assertIn("raise\n", source)
 
 
 if __name__ == "__main__":

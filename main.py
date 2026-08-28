@@ -37,7 +37,7 @@ from data import build_loader
 from lr_scheduler import build_scheduler
 from optimizer import build_optimizer
 from logger import create_logger
-from utils import load_checkpoint, load_pretrained, save_checkpoint, NativeScalerWithGradNormCount, auto_resume_helper
+from utils import load_checkpoint, load_pretrained, save_checkpoint, NativeScalerWithGradNormCount, auto_resume_helper, scale_learning_rates
 
 from mtl_loss_schemes import MultiTaskLoss, get_loss
 from constrained_mtl import (
@@ -1019,23 +1019,7 @@ if __name__ == '__main__':
     else:
         cudnn.benchmark = True
 
-    # linear scale the learning rate according to total batch size, may not be optimal
-    linear_scaled_lr = config.TRAIN.BASE_LR * \
-        config.DATA.BATCH_SIZE * dist.get_world_size() / 512.0
-    linear_scaled_warmup_lr = config.TRAIN.WARMUP_LR * \
-        config.DATA.BATCH_SIZE * dist.get_world_size() / 512.0
-    linear_scaled_min_lr = config.TRAIN.MIN_LR * \
-        config.DATA.BATCH_SIZE * dist.get_world_size() / 512.0
-    # gradient accumulation also need to scale the learning rate
-    if config.TRAIN.ACCUMULATION_STEPS > 1:
-        linear_scaled_lr = linear_scaled_lr * config.TRAIN.ACCUMULATION_STEPS
-        linear_scaled_warmup_lr = linear_scaled_warmup_lr * config.TRAIN.ACCUMULATION_STEPS
-        linear_scaled_min_lr = linear_scaled_min_lr * config.TRAIN.ACCUMULATION_STEPS
-    config.defrost()
-    config.TRAIN.BASE_LR = linear_scaled_lr
-    config.TRAIN.WARMUP_LR = linear_scaled_warmup_lr
-    config.TRAIN.MIN_LR = linear_scaled_min_lr
-    config.freeze()
+    lr_scale_info = scale_learning_rates(config, dist.get_world_size())
 
     timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
     output_dir = os.path.join(config.OUTPUT, f"run_{timestamp}")
@@ -1055,6 +1039,7 @@ if __name__ == '__main__':
 
     logger.info(config.dump())
     logger.info(json.dumps(vars(args)))
+    logger.info("Runtime learning-rate scaling: %s", json.dumps(lr_scale_info, sort_keys=True))
     logger.info(
         "Runtime: torch=%s cuda=%s cudnn=%s device=%s amp=%s deterministic=%s tf32(matmul=%s,cudnn=%s) debug_repro_steps=%s",
         torch.__version__,
