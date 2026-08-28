@@ -77,6 +77,14 @@ class UniPoRATrainingAlignmentTests(unittest.TestCase):
         self.assertIn("resume_artifact_validation", source)
         self.assertIn("Refusing to use a legacy Stage-1 grouping", config_utils_source)
 
+    def test_stage1_allows_only_gradscaler_confirmed_amp_backoff(self):
+        source = (PROJECT_ROOT / "ag_mtlora/stage1.py").read_text(encoding="utf-8")
+
+        self.assertIn("loss_scale_after < loss_scale_before", source)
+        self.assertIn("optimizer_step_skipped = True", source)
+        self.assertIn("Recoverable AMP overflow", source)
+        self.assertIn("Repeated AMP gradient overflow did not stabilize", source)
+
     def test_main_uses_unipora_independent_process_semantics(self):
         tree = _parse("main.py")
         call_names = {

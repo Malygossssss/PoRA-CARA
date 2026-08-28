@@ -66,6 +66,31 @@ class SmokeTestCriterion(nn.Module):
         return task_loss, {"task_a": task_loss, "total": task_loss}
 
 
+class FakeStage1LossScaler:
+    def __init__(self, scale_before, scale_after, grad_norm):
+        self.scale = float(scale_before)
+        self.scale_after = float(scale_after)
+        self.grad_norm = float(grad_norm)
+
+    def state_dict(self):
+        return {"scale": self.scale}
+
+    def __call__(self, *args, **kwargs):
+        self.scale = self.scale_after
+        return torch.tensor(self.grad_norm)
+
+
+class FakeStage1Scheduler:
+    def __init__(self):
+        self.updates = []
+
+    def step_update(self, update):
+        self.updates.append(update)
+
+    def state_dict(self):
+        return {"updates": list(self.updates)}
+
+
 def build_stage1_config(tmpdir, split_mode="train_meta_strict"):
     config = CN()
     config.SEED = 7
@@ -127,6 +152,52 @@ def build_update_config_args(cfg_path, tmpdir, tasks="task_a,task_b"):
 
 
 class Stage1MetaSplitTest(unittest.TestCase):
+    def test_amp_scale_backoff_is_treated_as_recoverable_skipped_step(self):
+        model = nn.Linear(2, 1)
+        optimizer = torch.optim.SGD(model.parameters(), lr=1e-4)
+        scheduler = FakeStage1Scheduler()
+        runtime = stage1.Stage1TrainRuntime(
+            optimizer=optimizer,
+            lr_scheduler=scheduler,
+            loss_scaler=FakeStage1LossScaler(65536.0, 32768.0, float("inf")),
+            amp_enabled=True,
+            clip_grad=5.0,
+        )
+
+        result = stage1.stage1_optimizer_step(
+            runtime,
+            torch.tensor(1.0, requires_grad=True),
+            model,
+            {"phase": "warmup", "epoch": 0, "batch": 0},
+        )
+
+        self.assertTrue(result.optimizer_step_skipped)
+        self.assertIsNone(result.grad_norm)
+        self.assertEqual(result.loss_scale_before, 65536.0)
+        self.assertEqual(result.loss_scale_after, 32768.0)
+        self.assertEqual(runtime.amp_overflow_count, 1)
+        self.assertEqual(runtime.consecutive_amp_overflows, 1)
+        self.assertEqual(runtime.global_step, 1)
+        self.assertEqual(scheduler.updates, [0])
+
+    def test_nonfinite_grad_without_amp_scale_backoff_still_aborts(self):
+        model = nn.Linear(2, 1)
+        runtime = stage1.Stage1TrainRuntime(
+            optimizer=torch.optim.SGD(model.parameters(), lr=1e-4),
+            lr_scheduler=FakeStage1Scheduler(),
+            loss_scaler=FakeStage1LossScaler(32768.0, 32768.0, float("inf")),
+            amp_enabled=True,
+            clip_grad=5.0,
+        )
+
+        with self.assertRaisesRegex(stage1.Stage1NumericalError, "grad_norm"):
+            stage1.stage1_optimizer_step(
+                runtime,
+                torch.tensor(1.0, requires_grad=True),
+                model,
+                {"phase": "warmup", "epoch": 0, "batch": 1},
+            )
+
     def test_nonfinite_guard_reports_tensor_and_training_context(self):
         context = {"phase": "warmup", "epoch": 2, "batch": 17, "task": "normals"}
 

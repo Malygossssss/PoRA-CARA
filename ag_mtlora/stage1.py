@@ -74,6 +74,8 @@ class Stage1TrainRuntime:
     amp_enabled: bool
     clip_grad: Optional[float]
     global_step: int = 0
+    amp_overflow_count: int = 0
+    consecutive_amp_overflows: int = 0
 
     @property
     def learning_rate(self) -> float:
@@ -83,6 +85,14 @@ class Stage1TrainRuntime:
     def loss_scale(self) -> float:
         state = self.loss_scaler.state_dict()
         return float(state.get("scale", 1.0))
+
+
+@dataclass(frozen=True)
+class Stage1StepResult:
+    grad_norm: Optional[float]
+    optimizer_step_skipped: bool
+    loss_scale_before: float
+    loss_scale_after: float
 
 
 class Stage1NumericalError(RuntimeError):
@@ -222,6 +232,8 @@ def save_stage1_last_good_checkpoint(
             "lr_scheduler": runtime.lr_scheduler.state_dict(),
             "scaler": runtime.loss_scaler.state_dict(),
             "global_step": int(runtime.global_step),
+            "amp_overflow_count": int(runtime.amp_overflow_count),
+            "consecutive_amp_overflows": int(runtime.consecutive_amp_overflows),
             "phase": phase,
             "epoch": int(epoch),
             "stage1_runtime_schema_version": STAGE1_RUNTIME_SCHEMA_VERSION,
@@ -269,19 +281,70 @@ def stage1_optimizer_step(
     execution_context: Optional[Dict] = None,
 ):
     ensure_finite_tensor(loss, "total_loss", execution_context)
+    loss_scale_before = runtime.loss_scale
     grad_norm = runtime.loss_scaler(
         loss,
         runtime.optimizer,
         clip_grad=runtime.clip_grad,
         parameters=model.parameters(),
     )
+    loss_scale_after = runtime.loss_scale
+    ensure_finite_number(loss_scale_after, "loss_scale", execution_context, positive=True)
+
+    optimizer_step_skipped = False
+    finite_grad_norm = None
     if grad_norm is not None:
-        ensure_finite_tensor(grad_norm, "grad_norm", execution_context)
-    ensure_finite_number(runtime.loss_scale, "loss_scale", execution_context, positive=True)
+        grad_norm_is_finite = bool(torch.isfinite(grad_norm).all().item())
+        amp_scale_backed_off = bool(
+            runtime.amp_enabled and loss_scale_after < loss_scale_before
+        )
+        if not grad_norm_is_finite and amp_scale_backed_off:
+            optimizer_step_skipped = True
+            runtime.amp_overflow_count += 1
+            runtime.consecutive_amp_overflows += 1
+            overflow_context = update_stage1_execution_context(
+                dict(execution_context or {}),
+                loss_scale_before=loss_scale_before,
+                loss_scale_after=loss_scale_after,
+                amp_overflow_count=runtime.amp_overflow_count,
+                consecutive_amp_overflows=runtime.consecutive_amp_overflows,
+            )
+            if runtime.consecutive_amp_overflows > 16 or loss_scale_after < 1.0:
+                raise Stage1NumericalError(
+                    "Repeated AMP gradient overflow did not stabilize during Stage-1.",
+                    details=overflow_context,
+                )
+        else:
+            ensure_finite_tensor(grad_norm, "grad_norm", execution_context)
+            finite_grad_norm = float(grad_norm.detach().float().item())
+
+    if not optimizer_step_skipped:
+        runtime.consecutive_amp_overflows = 0
     runtime.lr_scheduler.step_update(runtime.global_step)
     runtime.global_step += 1
     runtime.optimizer.zero_grad()
-    return grad_norm
+    return Stage1StepResult(
+        grad_norm=finite_grad_norm,
+        optimizer_step_skipped=optimizer_step_skipped,
+        loss_scale_before=loss_scale_before,
+        loss_scale_after=loss_scale_after,
+    )
+
+
+def log_stage1_step_result(logger, result: Stage1StepResult, execution_context: Dict) -> str:
+    if result.optimizer_step_skipped:
+        logger.warning(
+            "Recoverable AMP overflow; optimizer step skipped and loss scale backed off | phase=%s | epoch=%s | batch=%s | scale=%.6g->%.6g",
+            execution_context.get("phase"),
+            execution_context.get("epoch"),
+            execution_context.get("batch"),
+            result.loss_scale_before,
+            result.loss_scale_after,
+        )
+        return "skipped_amp_overflow"
+    if result.grad_norm is None:
+        return "unavailable"
+    return f"{result.grad_norm:.6f}"
 
 
 def group_to_key(group: Sequence[str]) -> str:
@@ -1313,7 +1376,18 @@ def warmup_and_collect_affinity(
                         f"task_losses.{task}",
                         update_stage1_execution_context(dict(execution_context), task=task),
                     )
-                grad_norm = stage1_optimizer_step(runtime, loss, model, execution_context)
+                step_result = stage1_optimizer_step(runtime, loss, model, execution_context)
+                execution_context = update_stage1_execution_context(
+                    execution_context,
+                    loss_scale=step_result.loss_scale_after,
+                    amp_overflow_count=runtime.amp_overflow_count,
+                    optimizer_step_skipped=step_result.optimizer_step_skipped,
+                )
+                grad_norm_text = log_stage1_step_result(
+                    logger,
+                    step_result,
+                    execution_context,
+                )
                 maybe_log_progress(
                     logger,
                     f"Warmup epoch {epoch_idx + 1}/{warmup_epochs}",
@@ -1323,7 +1397,7 @@ def warmup_and_collect_affinity(
                     extra=(
                         f"loss={float(loss.item()):.6f} | "
                         f"task_losses={round_value_map({task: value.item() for task, value in loss_dict.items() if task != 'total'})} | "
-                        f"lr={runtime.learning_rate:.10g} | grad_norm={float(grad_norm):.6f} | "
+                        f"lr={runtime.learning_rate:.10g} | grad_norm={grad_norm_text} | "
                         f"loss_scale={runtime.loss_scale:.6f}"
                     ),
                 )
@@ -1490,7 +1564,18 @@ def warmup_and_collect_affinity(
                             )
             epoch_batches += 1
 
-            grad_norm = stage1_optimizer_step(runtime, loss, model, execution_context)
+            step_result = stage1_optimizer_step(runtime, loss, model, execution_context)
+            execution_context = update_stage1_execution_context(
+                execution_context,
+                loss_scale=step_result.loss_scale_after,
+                amp_overflow_count=runtime.amp_overflow_count,
+                optimizer_step_skipped=step_result.optimizer_step_skipped,
+            )
+            grad_norm_text = log_stage1_step_result(
+                logger,
+                step_result,
+                execution_context,
+            )
             maybe_log_progress(
                 logger,
                 f"Affinity epoch {affinity_epoch_idx + 1}/{affinity_score_epochs}",
@@ -1500,7 +1585,7 @@ def warmup_and_collect_affinity(
                 extra=(
                     f"loss={float(loss.item()):.6f} | "
                     f"task_losses={round_value_map({task: value.item() for task, value in loss_dict.items() if task != 'total'})} | "
-                    f"lr={runtime.learning_rate:.10g} | grad_norm={float(grad_norm):.6f} | "
+                    f"lr={runtime.learning_rate:.10g} | grad_norm={grad_norm_text} | "
                     f"loss_scale={runtime.loss_scale:.6f}"
                 ),
             )

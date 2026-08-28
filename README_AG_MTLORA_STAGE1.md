@@ -200,8 +200,11 @@ baseline checkpoint 初始化规则：
 失败诊断规则：
 
 - 每个健康 epoch 原子更新 `last_good_checkpoint.pth`。
-- 任何非有限 output、task loss、total loss、affinity gradient/dot、grad norm、
-  loss scale、参数或 buffer 都会立即中止。
+- 除下述 GradScaler 可恢复回退外，任何非有限 output、task loss、total loss、
+  affinity gradient/dot、grad norm、loss scale、参数或 buffer 都会立即中止。
+- GradScaler 初始 scale 过高时，若检测到 optimizer step 已被安全跳过且 scale
+  自动回退，会记录 `Recoverable AMP overflow` warning 后继续；scale 不回退的
+  非有限梯度、连续 16 次以上溢出或 scale 降到 1 以下仍会中止。
 - 日志以 `STAGE1_ABORTED` 结束，同时写 `failure_report.json`（多进程为
   `failure_report_rankN.json`）和 `status: failed` 的
   `stage1_artifacts.json`；报告包含 traceback、phase/epoch/batch/task、sample
