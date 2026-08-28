@@ -80,11 +80,14 @@ AGMTLORA:
 Stage-1 的目标是在 task-specific prompt 开启的条件下，只对 shared LoRA 参数评估 task affinity，并搜索任务分组。基础配置中的 `MODEL.PROMPT.ENABLED: True` 会直接用于 Stage-1，不再通过 CLI 临时关闭 prompt：
 
 ```bash
-python scripts/ag_mtlora_stage1_prepare.py \
+CUDA_VISIBLE_DEVICES=0 python -m torch.distributed.launch \
+  --nproc_per_node 1 \
+  --master_port 29501 \
+  scripts/ag_mtlora_stage1_prepare.py \
   --cfg configs/mtlora/tiny_448/pascal/unipora_cara_tiny_448_r64_prom50_global_group_proxy_2lr.yaml \
   --pascal PASCAL_MT \
   --tasks semseg,normals,sal,human_parts \
-  --batch-size 32 \
+  --batch-size 9 \
   --resume-backbone backbone/Swin/swin_tiny_patch4_window7_224.pth
 ```
 
@@ -192,16 +195,20 @@ Stage-1 和正式训练构建模型后都会调用 `mark_prompt_as_trainable()`�
 正式训练使用 Stage-1 输出的 resolved config：
 
 ```powershell
-torchrun --nproc_per_node=1 main.py `
-  --cfg output\<MODEL.NAME>\<TAG>\ag_mtlora_stage1_prepare\run_<timestamp>\resolved_agmtlora_config__group_proxy.yaml `
-  --pascal D:\path\to\PASCAL_MT `
-  --tasks semseg,normals,sal,human_parts `
-  --batch-size 8 `
-  --epochs 300 `
-  --ckpt-freq 20 `
-  --eval-freq 5 `
-  --resume output\<MODEL.NAME>\<TAG>\ag_mtlora_stage1_prepare\run_<timestamp>\post_affinity_checkpoint.pth `
-  --skip_initial_validation
+STAGE1_DIR=output/unipora_cara_tiny_448_r64_prom50_global_group_proxy_2lr/default/ag_mtlora_stage1_prepare/run_新时间戳
+
+CUDA_VISIBLE_DEVICES=0 python -m torch.distributed.launch \
+  --nproc_per_node 1 \
+  --master_port 29501 \
+  main.py \
+  --cfg "$STAGE1_DIR/resolved_agmtlora_config__group_proxy.yaml" \
+  --pascal PASCAL_MT \
+  --tasks semseg,normals,sal,human_parts \
+  --batch-size 10 \
+  --epochs 300 \
+  --ckpt-freq 20 \
+  --eval-freq 5 \
+  --resume "$STAGE1_DIR/post_affinity_checkpoint.pth"
 ```
 
 如果需要与 UniPoRA 当前代码严格一致的双卡启动：
