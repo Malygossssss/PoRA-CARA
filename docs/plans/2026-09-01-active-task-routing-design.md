@@ -13,4 +13,3 @@ The argument remains optional. Non-prompted AG-MTLoRA calls omit it and retain t
 ## Verification
 
 Unit tests will compare the selected active-task attention output with the same task branch from the legacy all-task computation while dropout is disabled. Instrumentation will verify that active routing executes one task attention branch rather than every task branch. Existing prompt, Stage-1, training-alignment, and syntax tests will cover compatibility. A focused inference benchmark can subsequently measure GPU speed, but performance improvement is not asserted in a timing-sensitive unit test.
-

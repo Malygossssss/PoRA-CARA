@@ -50,4 +50,3 @@
 2. Run training-alignment and configuration tests.
 3. Compile all modified Python modules with `python -m py_compile`.
 4. Inspect `git diff --check`, the final diff, and branch status.
-
