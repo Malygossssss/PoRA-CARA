@@ -344,7 +344,12 @@ class MTLoRALinear(LoRALayer):
             @ self.lora_shared_B_groups[group_name].transpose(0, 1)
         ) * self._get_group_scale(group_name)
 
-    def forward(self, x: torch.Tensor, x_tasks: Dict[str, torch.Tensor] = None):
+    def forward(
+        self,
+        x: torch.Tensor,
+        x_tasks: Dict[str, torch.Tensor] = None,
+        active_task: str = None,
+    ):
         # TODO: handle merging
         pretrained = self.linear(x)
         if not self.has_lora:
@@ -352,8 +357,20 @@ class MTLoRALinear(LoRALayer):
 
         x = self.lora_dropout(x)
         if self.ag_enabled:
+            if active_task is not None:
+                if self.tasks is None or active_task not in self.tasks:
+                    raise ValueError(
+                        f"active_task must be one of {list(self.tasks or [])}, got {active_task!r}."
+                    )
+                if active_task not in self.task_to_group:
+                    raise ValueError(
+                        f"active_task {active_task!r} does not have an AG-MTLoRA group mapping."
+                    )
+                routed_tasks = (active_task,)
+            else:
+                routed_tasks = self.tasks or []
             lora_tasks = {}
-            for task in (self.tasks or []):
+            for task in routed_tasks:
                 task_input_raw = x if x_tasks is None else x_tasks[task]
                 task_input = self.lora_dropout(task_input_raw)
                 task_pretrained = pretrained if x_tasks is None else self.linear(task_input_raw)
@@ -465,16 +482,22 @@ class MTLoRAQKV(LoRALayer):
             and self.v.get_task_lora_enabled(task)
         )
 
-    def forward(self, x: torch.Tensor, x_tasks: Dict[str, torch.Tensor] = None):
-        q_shared, q_tasks = self.q(x, x_tasks)
-        k_shared, k_tasks = self.k(x, x_tasks)
-        v_shared, v_tasks = self.v(x, x_tasks)
+    def forward(
+        self,
+        x: torch.Tensor,
+        x_tasks: Dict[str, torch.Tensor] = None,
+        active_task: str = None,
+    ):
+        q_shared, q_tasks = self.q(x, x_tasks, active_task=active_task)
+        k_shared, k_tasks = self.k(x, x_tasks, active_task=active_task)
+        v_shared, v_tasks = self.v(x, x_tasks, active_task=active_task)
 
         task_outputs = None
         if self.tasks is not None and q_tasks is not None and k_tasks is not None and v_tasks is not None:
             task_outputs = {
                 task: torch.cat([q_tasks[task], k_tasks[task], v_tasks[task]], dim=-1)
-                for task in self.tasks
+                for task in q_tasks.keys()
+                if task in k_tasks and task in v_tasks
             }
 
         return torch.cat([q_shared, k_shared, v_shared], dim=-1), task_outputs

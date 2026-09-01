@@ -8,7 +8,7 @@ from yacs.config import CfgNode as CN
 
 from config import get_config
 from models.build import build_model
-from models.lora import mark_only_lora_as_trainable, mark_prompt_as_trainable
+from models.lora import MTLoRALinear, mark_only_lora_as_trainable, mark_prompt_as_trainable
 from models.swin_transformer_vpt import PromptedSwinTransformer, PromptedWindowAttention
 
 
@@ -234,6 +234,80 @@ class MTLoRAPromptTest(unittest.TestCase):
         self.assertIsNotNone(task_outputs)
         self.assertEqual(set(task_outputs.keys()), set(TASKS))
         self.assertEqual(len(calls), 1 + len(TASKS))
+
+    def test_ag_linear_active_task_matches_full_routing_branch(self):
+        layer = MTLoRALinear(
+            4,
+            6,
+            r={"group_0": 2, "group_1": 2},
+            lora_shared_scale=1.0,
+            lora_dropout=0.0,
+            tasks=TASKS,
+            task_to_group={"semseg": "group_0", "sal": "group_1"},
+        )
+        with torch.no_grad():
+            for group in layer.lora_shared_B_groups.values():
+                group.normal_()
+        x = torch.randn(2, 3, 4)
+
+        shared_output, all_task_outputs = layer(x)
+        selected_shared_output, selected_task_outputs = layer(x, active_task="sal")
+
+        torch.testing.assert_close(selected_shared_output, shared_output)
+        self.assertEqual(set(selected_task_outputs), {"sal"})
+        torch.testing.assert_close(selected_task_outputs["sal"], all_task_outputs["sal"])
+        with self.assertRaisesRegex(ValueError, "active_task"):
+            layer(x, active_task="unknown")
+
+    def test_prompt_attention_active_task_computes_only_selected_branch(self):
+        attention = PromptedWindowAttention(
+            num_prompts=2,
+            dim=8,
+            window_size=(2, 2),
+            num_heads=2,
+            tasks=TASKS,
+            mtlora=make_mtlora(ag_enabled=True),
+            layer_idx=0,
+            lora=True,
+        )
+        calls = []
+        original_apply_attention = attention._apply_attention_from_qkv
+
+        def wrapped_apply_attention(qkv, batch_windows, token_count, channels, mask=None):
+            calls.append(qkv)
+            return original_apply_attention(qkv, batch_windows, token_count, channels, mask=mask)
+
+        attention._apply_attention_from_qkv = wrapped_apply_attention
+        x = torch.randn(1, 6, 8)
+
+        _, all_task_outputs = attention(x)
+        calls.clear()
+        _, selected_task_outputs = attention(x, active_task="sal")
+
+        self.assertEqual(set(selected_task_outputs), {"sal"})
+        torch.testing.assert_close(selected_task_outputs["sal"], all_task_outputs["sal"])
+        self.assertEqual(len(calls), 2)
+
+    def test_prompted_backbone_propagates_active_task_to_attention(self):
+        model = build_model(make_model_config(ag_enabled=True))
+        model.eval()
+        active_tasks = []
+        for module in model.modules():
+            if not isinstance(module, PromptedWindowAttention):
+                continue
+            original_forward = module.forward
+
+            def wrapped_forward(*args, _forward=original_forward, **kwargs):
+                active_tasks.append(kwargs.get("active_task"))
+                return _forward(*args, **kwargs)
+
+            module.forward = wrapped_forward
+
+        with torch.no_grad():
+            model(torch.randn(1, 3, 32, 32), task="semseg", return_stages=True)
+
+        self.assertGreater(len(active_tasks), 0)
+        self.assertEqual(set(active_tasks), {"semseg"})
 
     def test_prompt_parameters_are_trainable_after_lora_freeze(self):
         model = build_model(make_model_config())

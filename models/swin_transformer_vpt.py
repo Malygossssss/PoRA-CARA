@@ -266,14 +266,14 @@ class PromptedBasicLayer(nn.Module):
         if deep_prompt_embd.shape[0] == num_blocks:
             for i in range(num_blocks):
                 x = self._replace_prompt(x, deep_prompt_embd[i].expand(B, -1, -1))
-                x, tasks_lora = self.blocks[i](x)
+                x, tasks_lora = self.blocks[i](x, active_task=task)
                 if tasks_lora is not None:
                     x = tasks_lora[task]
         else:
             for i in range(num_blocks):
                 if i > 0:
                     x = self._replace_prompt(x, deep_prompt_embd[i - 1].expand(B, -1, -1))
-                x, tasks_lora = self.blocks[i](x)
+                x, tasks_lora = self.blocks[i](x, active_task=task)
                 if tasks_lora is not None:
                     x = tasks_lora[task]
 
@@ -379,7 +379,7 @@ class PromptedSwinTransformerBlock(SwinTransformerBlock):
             lora=lora,
         )
 
-    def forward(self, x):
+    def forward(self, x, active_task=None):
         H, W = self.input_resolution
         B, L, C = x.shape
         shortcut = x
@@ -399,7 +399,11 @@ class PromptedSwinTransformerBlock(SwinTransformerBlock):
         prompt_windows = prompt_windows.reshape((-1, prompt_count, C))
         x_windows = torch.cat((prompt_windows, x_windows), dim=1)
 
-        attn_windows, attn_windows_lora_tasks = self.attn(x_windows, mask=self.attn_mask)
+        attn_windows, attn_windows_lora_tasks = self.attn(
+            x_windows,
+            mask=self.attn_mask,
+            active_task=active_task,
+        )
 
         prompt_emb = attn_windows[:, :prompt_count, :]
         attn_windows = attn_windows[:, prompt_count:, :]
@@ -407,7 +411,7 @@ class PromptedSwinTransformerBlock(SwinTransformerBlock):
 
         prompt_emb_lora_tasks = {}
         if attn_windows_lora_tasks is not None:
-            for task in self.tasks:
+            for task in attn_windows_lora_tasks.keys():
                 prompt_task = attn_windows_lora_tasks[task][:, :prompt_count, :]
                 prompt_emb_lora_tasks[task] = prompt_task.view(-1, B, prompt_count, C).mean(0)
                 attn_windows_lora_tasks[task] = attn_windows_lora_tasks[task][:, prompt_count:, :]
@@ -418,7 +422,7 @@ class PromptedSwinTransformerBlock(SwinTransformerBlock):
         x = x.view(B, H * W, C)
 
         if attn_windows_lora_tasks is not None:
-            for task in self.tasks:
+            for task in attn_windows_lora_tasks.keys():
                 task_windows = attn_windows_lora_tasks[task].view(-1, self.window_size, self.window_size, C)
                 task_x = window_reverse(task_windows, self.window_size, H, W)
                 if self.shift_size > 0:
@@ -435,19 +439,26 @@ class PromptedSwinTransformerBlock(SwinTransformerBlock):
         x = shortcut + self.drop_path(x)
 
         mlp_inputs = (
-            {task: self.norm2(attn_windows_lora_tasks[task]) for task in self.tasks}
+            {
+                task: self.norm2(task_output)
+                for task, task_output in attn_windows_lora_tasks.items()
+            }
             if attn_windows_lora_tasks is not None
             else None
         )
-        mlp_result, mlp_lora_tasks = self.mlp(self.norm2(x), mlp_inputs)
+        mlp_result, mlp_lora_tasks = self.mlp(
+            self.norm2(x),
+            mlp_inputs,
+            active_task=active_task,
+        )
         if mlp_lora_tasks is None:
             return x + self.drop_path(mlp_result), None
 
         if attn_windows_lora_tasks is None:
-            for task in self.tasks:
+            for task in mlp_lora_tasks.keys():
                 mlp_lora_tasks[task] = shortcut + self.drop_path(mlp_lora_tasks[task])
         else:
-            for task in self.tasks:
+            for task in mlp_lora_tasks.keys():
                 mlp_lora_tasks[task] = attn_windows_lora_tasks[task] + self.drop_path(
                     mlp_lora_tasks[task]
                 )
@@ -519,22 +530,26 @@ class PromptedWindowAttention(WindowAttention):
         attn = self.attn_drop(attn)
         return (attn @ v).transpose(1, 2).reshape(B_, N, C)
 
-    def forward(self, x, x_tasks=None, mask=None):
+    def forward(self, x, x_tasks=None, mask=None, active_task=None):
         B_, N, C = x.shape
-        qkv, qkv_tasks = self.qkv(x, x_tasks)
+        qkv, qkv_tasks = self.qkv(x, x_tasks, active_task=active_task)
         x = self._apply_attention_from_qkv(qkv, B_, N, C, mask=mask)
 
         attn_task_outputs = None
         if qkv_tasks is not None:
             attn_task_outputs = {
                 task: self._apply_attention_from_qkv(qkv_tasks[task], B_, N, C, mask=mask)
-                for task in self.tasks
+                for task in qkv_tasks.keys()
             }
 
-        x, x_proj_lora_tasks = self.proj(x, attn_task_outputs)
+        x, x_proj_lora_tasks = self.proj(
+            x,
+            attn_task_outputs,
+            active_task=active_task,
+        )
         x = self.proj_drop(x)
         if x_proj_lora_tasks is not None:
-            for task in self.tasks:
+            for task in x_proj_lora_tasks.keys():
                 x_proj_lora_tasks[task] = self.proj_drop(x_proj_lora_tasks[task])
         return x, x_proj_lora_tasks
 

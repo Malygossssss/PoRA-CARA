@@ -38,7 +38,7 @@ class CompatLinear(nn.Linear):
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
 
-    def forward(self, input: Tensor, x_tasks: dict = None) -> Tensor:
+    def forward(self, input: Tensor, x_tasks: dict = None, active_task: str = None) -> Tensor:
         return super().forward(input), None
 
 def _get_shared_only_rank(mtlora, layer_idx):
@@ -126,18 +126,22 @@ class Mlp(nn.Module):
         self.tasks = tasks
         self.drop = nn.Dropout(drop)
 
-    def forward(self, x, x_tasks=None):
-        x, fc1_lora_tasks = self.fc1(x, x_tasks)
+    def forward(self, x, x_tasks=None, active_task=None):
+        x, fc1_lora_tasks = self.fc1(x, x_tasks, active_task=active_task)
         x = self.act(x)
         x = self.drop(x)
         if fc1_lora_tasks is not None:
-            for task in self.tasks:
+            for task in fc1_lora_tasks.keys():
                 fc1_lora_tasks[task] = self.act(fc1_lora_tasks[task])
                 fc1_lora_tasks[task] = self.drop(fc1_lora_tasks[task])
-        x, fc2_lora_tasks = self.fc2(x, fc1_lora_tasks)
+        x, fc2_lora_tasks = self.fc2(
+            x,
+            fc1_lora_tasks,
+            active_task=active_task,
+        )
         x = self.drop(x)
         if fc2_lora_tasks is not None:
-            for task in self.tasks:
+            for task in fc2_lora_tasks.keys():
                 fc2_lora_tasks[task] = self.drop(fc2_lora_tasks[task])
         return x, fc2_lora_tasks
 
@@ -317,27 +321,31 @@ class WindowAttention(nn.Module):
         attn = self.attn_drop(attn)
         return (attn @ v).transpose(1, 2).reshape(B_, N, C)
 
-    def forward(self, x, x_tasks=None, mask=None):
+    def forward(self, x, x_tasks=None, mask=None, active_task=None):
         """
         Args:
             x: input features with shape of (num_windows*B, N, C)
             mask: (0/-inf) mask with shape of (num_windows, Wh*Ww, Wh*Ww) or None
         """
         B_, N, C = x.shape
-        qkv, qkv_tasks = self.qkv(x, x_tasks)
+        qkv, qkv_tasks = self.qkv(x, x_tasks, active_task=active_task)
         x = self._apply_attention_from_qkv(qkv, B_, N, C, mask=mask)
 
         attn_task_outputs = None
         if qkv_tasks is not None:
             attn_task_outputs = {
                 task: self._apply_attention_from_qkv(qkv_tasks[task], B_, N, C, mask=mask)
-                for task in self.tasks
+                for task in qkv_tasks.keys()
             }
 
-        x, x_proj_lora_tasks = self.proj(x, attn_task_outputs)
+        x, x_proj_lora_tasks = self.proj(
+            x,
+            attn_task_outputs,
+            active_task=active_task,
+        )
         x = self.proj_drop(x)
         if x_proj_lora_tasks is not None:
-            for task in self.tasks:
+            for task in x_proj_lora_tasks.keys():
                 x_proj_lora_tasks[task] = self.proj_drop(
                     x_proj_lora_tasks[task])
         return x, x_proj_lora_tasks
