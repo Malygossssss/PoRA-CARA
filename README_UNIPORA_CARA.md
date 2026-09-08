@@ -87,7 +87,7 @@ CUDA_VISIBLE_DEVICES=0 python -m torch.distributed.launch \
   --cfg configs/mtlora/tiny_448/pascal/unipora_cara_tiny_448_r64_prom50_global_group_proxy_2lr.yaml \
   --pascal PASCAL_MT \
   --tasks semseg,normals,sal,human_parts \
-  --batch-size 9 \
+  --batch-size 10 \
   --resume-backbone backbone/Swin/swin_tiny_patch4_window7_224.pth
 ```
 
@@ -204,7 +204,7 @@ CUDA_VISIBLE_DEVICES=0 python -m torch.distributed.launch \
   --cfg "$STAGE1_DIR/resolved_agmtlora_config__group_proxy.yaml" \
   --pascal PASCAL_MT \
   --tasks semseg,normals,sal,human_parts \
-  --batch-size 10 \
+  --batch-size 12 \
   --epochs 300 \
   --ckpt-freq 20 \
   --eval-freq 5 \
