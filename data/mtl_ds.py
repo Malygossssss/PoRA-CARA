@@ -873,13 +873,11 @@ def get_transformations(db_name, config):
     return transforms_tr, transforms_ts
 
 
-def get_mtl_train_dataloader(config, dataset, sampler=None):
+def get_mtl_train_dataloader(config, dataset):
     """ Return the train dataloader """
 
-    trainloader = DataLoader(dataset, batch_size=config.DATA.BATCH_SIZE,
-                             shuffle=(sampler is None), sampler=sampler,
-                             drop_last=True, num_workers=config.DATA.NUM_WORKERS,
-                             collate_fn=collate_mil, pin_memory=config.DATA.PIN_MEMORY)
+    trainloader = DataLoader(dataset, batch_size=config.DATA.BATCH_SIZE, shuffle=True, drop_last=True,
+                             num_workers=config.DATA.NUM_WORKERS, collate_fn=collate_mil, pin_memory=config.DATA.PIN_MEMORY)
     return trainloader
 
 
@@ -890,10 +888,9 @@ def get_mtl_val_dataset(db_name, config, transforms):
     return get_mtl_dataset(db_name, config, transforms, split='val')
 
 
-def get_mtl_val_dataloader(config, dataset, sampler=None):
+def get_mtl_val_dataloader(config, dataset):
     """ Return the validation dataloader """
-    testloader = DataLoader(dataset, batch_size=config.DATA.BATCH_SIZE,
-                            shuffle=False, sampler=sampler, drop_last=False,
+    testloader = DataLoader(dataset, batch_size=config.DATA.BATCH_SIZE, shuffle=False, drop_last=False,
                             num_workers=config.DATA.NUM_WORKERS, pin_memory=config.DATA.PIN_MEMORY)
     return testloader
 

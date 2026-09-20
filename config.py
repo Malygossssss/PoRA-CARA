@@ -182,6 +182,17 @@ _C.MODEL.DECODER_CHANNELS = [18, 36, 72, 144]
 
 _C.MODEL.SEGFORMER_CHANNELS = 256
 
+# Minimal visual prompt tuning support for CARA + AG-MTLoRA.
+_C.MODEL.PROMPT = CN()
+_C.MODEL.PROMPT.ENABLED = False
+_C.MODEL.PROMPT.NUM_TOKENS = 0
+_C.MODEL.PROMPT.DEEP = True
+_C.MODEL.PROMPT.LOCATION = 'prepend'
+_C.MODEL.PROMPT.DROPOUT = 0.0
+_C.MODEL.PROMPT.INITIATION = 'random'
+_C.MODEL.PROMPT.DYNAMIC_PROMPT = False
+_C.MODEL.PROMPT.SHARE_TASK_PROMPT = False
+
 # -----------------------------------------------------------------------------
 # Training settings
 # -----------------------------------------------------------------------------
@@ -194,6 +205,8 @@ _C.TRAIN.BASE_LR = 5e-4
 # _C.TRAIN.BASE_LR = 5e-5
 _C.TRAIN.WARMUP_LR = 5e-7
 _C.TRAIN.MIN_LR = 5e-6
+# Runtime guard: launchers must scale the configured learning rates exactly once.
+_C.TRAIN.LR_SCALED = False
 # Clip gradient norm
 _C.TRAIN.CLIP_GRAD = 5.0
 # Auto resume from latest checkpoint
@@ -204,6 +217,11 @@ _C.TRAIN.ACCUMULATION_STEPS = 1
 # Whether to use gradient checkpointing to save memory
 # could be overwritten by command line argument
 _C.TRAIN.USE_CHECKPOINT = False
+# Enable computing conflict gradient ratio (CR)
+_C.TRAIN.ENABLE_CONFLICT_RATIO = False
+# Number of batches between conflict ratio evaluations when enabled
+_C.TRAIN.CONFLICT_RATIO_PERIOD = 50
+
 # LR scheduler
 _C.TRAIN.LR_SCHEDULER = CN()
 _C.TRAIN.LR_SCHEDULER.NAME = 'cosine'
@@ -241,6 +259,26 @@ _C.TRAIN.LAYER_DECAY = 1.0
 _C.TRAIN.MOE = CN()
 # Only save model on master device
 _C.TRAIN.MOE.SAVE_MASTER = False
+
+# Constrained multi-task training
+_C.TRAIN.CONSTRAINED_MTL = CN()
+_C.TRAIN.CONSTRAINED_MTL.ENABLED = False
+_C.TRAIN.CONSTRAINED_MTL.PROTECTED_TASKS = []
+_C.TRAIN.CONSTRAINED_MTL.OBJECTIVE = 'avg_unconstrained'
+_C.TRAIN.CONSTRAINED_MTL.REF_MODE = 'warmup_loss'
+_C.TRAIN.CONSTRAINED_MTL.REF_EPOCH_START = 0
+_C.TRAIN.CONSTRAINED_MTL.REF_EPOCH_END = 0
+_C.TRAIN.CONSTRAINED_MTL.WARMUP_EPOCHS = 20
+_C.TRAIN.CONSTRAINED_MTL.USE_RELATIVE_LOSS = True
+_C.TRAIN.CONSTRAINED_MTL.EPS_RELAX = CN(new_allowed=True)
+_C.TRAIN.CONSTRAINED_MTL.REF_LOSSES = CN(new_allowed=True)
+_C.TRAIN.CONSTRAINED_MTL.DUAL_UPDATE_FREQ = 'epoch'
+_C.TRAIN.CONSTRAINED_MTL.DUAL_LR = 0.05
+_C.TRAIN.CONSTRAINED_MTL.DUAL_CLAMP_MAX = 10.0
+_C.TRAIN.CONSTRAINED_MTL.ALM_RHO = 1.0
+_C.TRAIN.CONSTRAINED_MTL.ALM_RHO_GROWTH = 1.5
+_C.TRAIN.CONSTRAINED_MTL.ALM_RHO_PATIENCE = 5
+_C.TRAIN.CONSTRAINED_MTL.VIOLATION_EMA = 0.9
 # -----------------------------------------------------------------------------
 # Augmentation settings
 # -----------------------------------------------------------------------------
@@ -548,6 +586,31 @@ def update_config(config, args):
 
     # output folder
     config.OUTPUT = os.path.join(config.OUTPUT, config.MODEL.NAME, config.TAG)
+
+    constrained_cfg = config.TRAIN.CONSTRAINED_MTL
+    if isinstance(constrained_cfg.PROTECTED_TASKS, str):
+        constrained_cfg.PROTECTED_TASKS = re.compile(
+            r'\s*,\s*').split(constrained_cfg.PROTECTED_TASKS)
+    elif constrained_cfg.PROTECTED_TASKS is None:
+        constrained_cfg.PROTECTED_TASKS = []
+    else:
+        constrained_cfg.PROTECTED_TASKS = list(constrained_cfg.PROTECTED_TASKS)
+
+    if config.MODEL.PROMPT.ENABLED:
+        if not config.MODEL.MTLORA.ENABLED:
+            raise ValueError("MODEL.PROMPT.ENABLED=True requires MODEL.MTLORA.ENABLED=True.")
+        if str(config.MODEL.PROMPT.LOCATION) != 'prepend':
+            raise ValueError("MODEL.PROMPT.LOCATION must be 'prepend' for CARA prompt support.")
+        if not bool(config.MODEL.PROMPT.DEEP):
+            raise ValueError("MODEL.PROMPT.DEEP must be True for CARA prompt support.")
+        if int(config.MODEL.PROMPT.NUM_TOKENS) <= 0:
+            raise ValueError("MODEL.PROMPT.NUM_TOKENS must be > 0 when MODEL.PROMPT.ENABLED=True.")
+        if str(config.MODEL.PROMPT.INITIATION) != 'random':
+            raise ValueError("MODEL.PROMPT.INITIATION must be 'random' for CARA prompt support.")
+        if bool(config.MODEL.PROMPT.DYNAMIC_PROMPT):
+            raise ValueError("MODEL.PROMPT.DYNAMIC_PROMPT is not supported in CARA's minimal prompt path.")
+        if bool(config.MODEL.PROMPT.SHARE_TASK_PROMPT):
+            raise ValueError("MODEL.PROMPT.SHARE_TASK_PROMPT is not supported in CARA's minimal prompt path.")
 
     # Normalize MTLoRA config
     if config.MODEL.MTLORA.ENABLED:

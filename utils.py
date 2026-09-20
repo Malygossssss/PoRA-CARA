@@ -29,6 +29,46 @@ import torch.nn.functional as F
 from models.lora import map_old_state_dict_weights
 
 
+def scale_learning_rates(config, world_size):
+    """Apply the Swin/UniPoRA global-batch LR rule exactly once."""
+    if bool(getattr(config.TRAIN, "LR_SCALED", False)):
+        raise RuntimeError("Learning rates have already been scaled for this runtime config.")
+
+    world_size = int(world_size)
+    if world_size <= 0:
+        raise ValueError(f"world_size must be positive, got {world_size}")
+
+    accumulation_steps = int(config.TRAIN.ACCUMULATION_STEPS)
+    global_batch_size = int(config.DATA.BATCH_SIZE) * world_size * accumulation_steps
+    scale = global_batch_size / 512.0
+    raw_lrs = {
+        "base_lr": float(config.TRAIN.BASE_LR),
+        "warmup_lr": float(config.TRAIN.WARMUP_LR),
+        "min_lr": float(config.TRAIN.MIN_LR),
+    }
+
+    config.defrost()
+    config.TRAIN.BASE_LR = raw_lrs["base_lr"] * scale
+    config.TRAIN.WARMUP_LR = raw_lrs["warmup_lr"] * scale
+    config.TRAIN.MIN_LR = raw_lrs["min_lr"] * scale
+    config.TRAIN.LR_SCALED = True
+    config.freeze()
+
+    return {
+        "world_size": world_size,
+        "batch_size_per_process": int(config.DATA.BATCH_SIZE),
+        "accumulation_steps": accumulation_steps,
+        "global_batch_size": global_batch_size,
+        "scale": scale,
+        "raw": raw_lrs,
+        "scaled": {
+            "base_lr": float(config.TRAIN.BASE_LR),
+            "warmup_lr": float(config.TRAIN.WARMUP_LR),
+            "min_lr": float(config.TRAIN.MIN_LR),
+        },
+    }
+
+
 def mkdir_if_missing(directory):
     if not os.path.exists(directory):
         try:

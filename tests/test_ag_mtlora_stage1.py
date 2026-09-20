@@ -6,12 +6,16 @@ from types import SimpleNamespace
 from unittest import mock
 
 import numpy as np
+import torch
+import torch.nn as nn
 import yaml
 from yacs.config import CfgNode as CN
 
 import ag_mtlora.stage1 as stage1
 import config as config_module
 import models.swin_transformer_mtlora as swin_mtlora_module
+from mtl_loss_schemes import SoftMaxwithLoss
+from utils import scale_learning_rates
 
 
 class FakeDataset:
@@ -28,6 +32,63 @@ class FakeDataset:
 class DummyResolvedConfig:
     def dump(self):
         return "MODEL:\n  AGMTLORA:\n    ENABLED: true\n"
+
+
+class FakePromptBackbone(nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.prompt_embeddings = nn.Parameter(torch.ones(1))
+        self.deep_prompt_embeddings = nn.Parameter(torch.ones(1))
+        self.lora_shared_A = nn.Parameter(torch.ones(1))
+        self.non_lora_weight = nn.Parameter(torch.ones(1))
+
+
+class FakePromptTaskModel(nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.backbone = FakePromptBackbone()
+        self.decoder = nn.Linear(1, 1)
+
+
+class SmokeTestModel(nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.norm = nn.BatchNorm2d(1)
+        self.head = nn.Conv2d(1, 1, kernel_size=1)
+
+    def forward(self, image):
+        return {"task_a": self.head(self.norm(image))}
+
+
+class SmokeTestCriterion(nn.Module):
+    def forward(self, outputs, targets):
+        task_loss = (outputs["task_a"] - targets["task_a"]).square().mean()
+        return task_loss, {"task_a": task_loss, "total": task_loss}
+
+
+class FakeStage1LossScaler:
+    def __init__(self, scale_before, scale_after, grad_norm):
+        self.scale = float(scale_before)
+        self.scale_after = float(scale_after)
+        self.grad_norm = float(grad_norm)
+
+    def state_dict(self):
+        return {"scale": self.scale}
+
+    def __call__(self, *args, **kwargs):
+        self.scale = self.scale_after
+        return torch.tensor(self.grad_norm)
+
+
+class FakeStage1Scheduler:
+    def __init__(self):
+        self.updates = []
+
+    def step_update(self, update):
+        self.updates.append(update)
+
+    def state_dict(self):
+        return {"updates": list(self.updates)}
 
 
 def build_stage1_config(tmpdir, split_mode="train_meta_strict"):
@@ -91,6 +152,196 @@ def build_update_config_args(cfg_path, tmpdir, tasks="task_a,task_b"):
 
 
 class Stage1MetaSplitTest(unittest.TestCase):
+    def test_amp_scale_backoff_is_treated_as_recoverable_skipped_step(self):
+        model = nn.Linear(2, 1)
+        optimizer = torch.optim.SGD(model.parameters(), lr=1e-4)
+        scheduler = FakeStage1Scheduler()
+        runtime = stage1.Stage1TrainRuntime(
+            optimizer=optimizer,
+            lr_scheduler=scheduler,
+            loss_scaler=FakeStage1LossScaler(65536.0, 32768.0, float("inf")),
+            amp_enabled=True,
+            clip_grad=5.0,
+        )
+
+        result = stage1.stage1_optimizer_step(
+            runtime,
+            torch.tensor(1.0, requires_grad=True),
+            model,
+            {"phase": "warmup", "epoch": 0, "batch": 0},
+        )
+
+        self.assertTrue(result.optimizer_step_skipped)
+        self.assertIsNone(result.grad_norm)
+        self.assertEqual(result.loss_scale_before, 65536.0)
+        self.assertEqual(result.loss_scale_after, 32768.0)
+        self.assertEqual(runtime.amp_overflow_count, 1)
+        self.assertEqual(runtime.consecutive_amp_overflows, 1)
+        self.assertEqual(runtime.global_step, 1)
+        self.assertEqual(scheduler.updates, [0])
+
+    def test_nonfinite_grad_without_amp_scale_backoff_still_aborts(self):
+        model = nn.Linear(2, 1)
+        runtime = stage1.Stage1TrainRuntime(
+            optimizer=torch.optim.SGD(model.parameters(), lr=1e-4),
+            lr_scheduler=FakeStage1Scheduler(),
+            loss_scaler=FakeStage1LossScaler(32768.0, 32768.0, float("inf")),
+            amp_enabled=True,
+            clip_grad=5.0,
+        )
+
+        with self.assertRaisesRegex(stage1.Stage1NumericalError, "grad_norm"):
+            stage1.stage1_optimizer_step(
+                runtime,
+                torch.tensor(1.0, requires_grad=True),
+                model,
+                {"phase": "warmup", "epoch": 0, "batch": 1},
+            )
+
+    def test_nonfinite_guard_reports_tensor_and_training_context(self):
+        context = {"phase": "warmup", "epoch": 2, "batch": 17, "task": "normals"}
+
+        with self.assertRaises(stage1.Stage1NumericalError) as raised:
+            stage1.ensure_finite_tensor(
+                torch.tensor([1.0, float("nan")]),
+                "task_losses.normals",
+                context,
+            )
+
+        self.assertEqual(raised.exception.details["phase"], "warmup")
+        self.assertEqual(raised.exception.details["epoch"], 2)
+        self.assertEqual(raised.exception.details["batch"], 17)
+        self.assertEqual(raised.exception.details["tensor_name"], "task_losses.normals")
+        self.assertEqual(raised.exception.details["tensor_stats"]["nonfinite_count"], 1)
+
+    def test_amp_smoke_test_restores_batchnorm_state_and_mode(self):
+        model = SmokeTestModel()
+        model.eval()
+        state_before = {
+            name: tensor.detach().clone()
+            for name, tensor in model.state_dict().items()
+        }
+        batch = {
+            "image": torch.randn(2, 1, 4, 4),
+            "task_a": torch.randn(2, 1, 4, 4),
+            "meta": {"image": ["sample_a", "sample_b"]},
+        }
+
+        result = stage1.run_stage1_amp_smoke_test(
+            model,
+            batch,
+            SmokeTestCriterion(),
+            ["task_a"],
+            torch.device("cpu"),
+            amp_enabled=False,
+        )
+
+        self.assertFalse(model.training)
+        self.assertGreater(result["checked_gradients"], 0)
+        self.assertEqual(result["sample_ids"], ["sample_a", "sample_b"])
+        for name, tensor_before in state_before.items():
+            self.assertTrue(torch.equal(model.state_dict()[name], tensor_before), name)
+
+    def test_scale_learning_rates_matches_formal_training_and_rejects_double_scaling(self):
+        config = CN()
+        config.DATA = CN()
+        config.DATA.BATCH_SIZE = 9
+        config.TRAIN = CN()
+        config.TRAIN.BASE_LR = 1.0e-3
+        config.TRAIN.WARMUP_LR = 1.0e-6
+        config.TRAIN.MIN_LR = 1.0e-5
+        config.TRAIN.ACCUMULATION_STEPS = 1
+        config.TRAIN.LR_SCALED = False
+        config.freeze()
+
+        scaled = scale_learning_rates(config, world_size=1)
+
+        self.assertAlmostEqual(config.TRAIN.BASE_LR, 1.7578125e-5)
+        self.assertAlmostEqual(config.TRAIN.WARMUP_LR, 1.7578125e-8)
+        self.assertAlmostEqual(config.TRAIN.MIN_LR, 1.7578125e-7)
+        self.assertEqual(scaled["global_batch_size"], 9)
+        self.assertTrue(config.TRAIN.LR_SCALED)
+        with self.assertRaisesRegex(RuntimeError, "already been scaled"):
+            scale_learning_rates(config, world_size=1)
+
+    def test_softmax_loss_returns_differentiable_zero_for_all_ignored_batch(self):
+        output = torch.randn(2, 7, 4, 4, requires_grad=True)
+        target = torch.full((2, 1, 4, 4), 255, dtype=torch.long)
+
+        loss = SoftMaxwithLoss(ignore_index=255)(output, target)
+
+        self.assertTrue(torch.isfinite(loss))
+        self.assertEqual(float(loss.item()), 0.0)
+        loss.backward()
+        self.assertIsNotNone(output.grad)
+        self.assertTrue(torch.isfinite(output.grad).all())
+        self.assertEqual(int(torch.count_nonzero(output.grad).item()), 0)
+
+    def test_stage1_scheduler_uses_search_duration_and_affinity_warmup(self):
+        config = CN()
+        config.TRAIN = CN()
+        config.TRAIN.EPOCHS = 300
+        config.TRAIN.WARMUP_EPOCHS = 20
+        config.freeze()
+
+        scheduler_config = stage1.build_stage1_scheduler_config(
+            config,
+            warmup_epochs=5,
+            total_epochs=55,
+        )
+
+        self.assertEqual(scheduler_config.TRAIN.EPOCHS, 55)
+        self.assertEqual(scheduler_config.TRAIN.WARMUP_EPOCHS, 5)
+        self.assertEqual(config.TRAIN.EPOCHS, 300)
+        self.assertEqual(config.TRAIN.WARMUP_EPOCHS, 20)
+
+    def test_build_task_model_keeps_prompt_trainable_for_stage1_optimizer(self):
+        config = CN()
+        config.MTL = False
+        config.MODEL = CN()
+        config.MODEL.MTLORA = CN()
+        config.MODEL.MTLORA.ENABLED = True
+        config.MODEL.MTLORA.FREEZE_PRETRAINED = True
+        config.MODEL.MTLORA.BIAS = "none"
+        config.MODEL.MTLORA.DOWNSAMPLER_ENABLED = False
+        config.MODEL.PROMPT = CN()
+        config.MODEL.PROMPT.ENABLED = True
+        config.TRAIN = CN()
+        config.TRAIN.FREEZE_PATCH_EMBED = True
+        config.TRAIN.FREEZE_LAYER_NORM = True
+        config.TRAIN.FREEZE_RELATIVE_POSITION_BIAS = True
+        config.TRAIN.FREEZE_DOWNSAMPLE_REDUCTION = True
+        config.TRAIN.BASE_LR = 1e-4
+        config.TRAIN.WEIGHT_DECAY = 0.05
+        config.TRAIN.OPTIMIZER = CN()
+        config.TRAIN.OPTIMIZER.NAME = "adamw"
+        config.TRAIN.OPTIMIZER.EPS = 1e-8
+        config.TRAIN.OPTIMIZER.BETAS = (0.9, 0.999)
+        config.TRAIN.OPTIMIZER.MOMENTUM = 0.9
+        config.freeze()
+
+        with mock.patch("ag_mtlora.stage1.build_model", return_value=FakePromptTaskModel()), mock.patch(
+            "ag_mtlora.stage1.maybe_load_initial_weights"
+        ):
+            model = stage1.build_task_model(config, torch.device("cpu"), mock.Mock())
+
+        prompt_params = [
+            param
+            for name, param in model.backbone.named_parameters()
+            if "prompt_embeddings" in name or "deep_prompt_embeddings" in name
+        ]
+        self.assertEqual(len(prompt_params), 2)
+        self.assertTrue(all(param.requires_grad for param in prompt_params))
+        self.assertFalse(model.backbone.non_lora_weight.requires_grad)
+
+        optimizer = stage1.build_optimizer(config, model)
+        optimizer_param_ids = {
+            id(param)
+            for group in optimizer.param_groups
+            for param in group["params"]
+        }
+        self.assertTrue(all(id(param) in optimizer_param_ids for param in prompt_params))
+
     def test_parse_predictor_progress_from_log_recovers_singletons_and_groups(self):
         with tempfile.TemporaryDirectory() as tmpdir:
             log_path = os.path.join(tmpdir, "log_rank0.txt")
@@ -1017,6 +1268,7 @@ class Stage1MetaSplitTest(unittest.TestCase):
 
             original_ranked_partitions = stage1.run_partition_search(tasks, final_predictions, max_groups=2)
             original_grouping_payload = {
+                "stage1_runtime_schema_version": stage1.STAGE1_RUNTIME_SCHEMA_VERSION,
                 "tasks": tasks,
                 "groups": [["task_a"], ["task_b"]],
                 "task_to_group": {"task_a": "group_0", "task_b": "group_1"},

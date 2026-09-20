@@ -37,6 +37,8 @@ AG-MTLoRA Stage-1 是在当前 MTLoRA / UniPoRA 代码基础上实现的一个 g
   - grouping / partition 枚举、group rank 解析、artifact 路径解析。
 - `ag_mtlora/stage1.py`
   - Stage-1 prepare 主流程：warmup、多 epoch directed affinity、group proxy、predictor chain、partition search、artifact 导出。
+- `ag_mtlora/stage1_multiprocess.py`
+  - 解析 rank 环境、隔离各 rank 输出目录，并生成单 rank 与共享 run manifest。
 - `scripts/ag_mtlora_stage1_prepare.py`
   - 两步工作流中的 Step-1 入口脚本。
 - `scripts/ag_mtlora_stage1_replay_search.py`
@@ -80,6 +82,13 @@ AG-MTLoRA Stage-1 是在当前 MTLoRA / UniPoRA 代码基础上实现的一个 g
 - 在 warmup 结束后的同一个 baseline MTLoRA 上继续训练 `MODEL.AGMTLORA.AFFINITY_SCORE_EPOCHS`
 - 这一步按 batch 在线累计 directed affinity
 - 结束后保存 `post_affinity_checkpoint.pth`
+
+两段共用同一个 optimizer/runtime：配置中的三个学习率先按
+`batch_size * WORLD_SIZE * accumulation_steps / 512` 缩放一次；warmup 段线性
+升温，affinity 段 cosine 衰减。forward/loss 使用 autocast，反向使用
+GradScaler，并应用 `TRAIN.CLIP_GRAD`。PASCAL 中某个 batch 的
+human-parts 标签全部为 ignore 时，该任务返回可求导的零损失，避免
+`NLLLoss(mean)` 产生 NaN。
 
 这一步与 ETAP 对齐的地方是：
 
@@ -185,6 +194,23 @@ baseline checkpoint 初始化规则：
 - `post_affinity_checkpoint.pth` 是多 epoch affinity-score 累计结束后的 baseline 检查点。
 - Step-2 默认推荐从 `post_affinity_checkpoint.pth` 初始化。
 - 加载时会自动把单一 shared TA 权重复制到每个 group-specific TA bank。
+- `post_affinity_checkpoint.pth` 只有在全量 state 有限且 train-mode AMP
+  forward/backward smoke test 通过后才会原子发布。
+
+失败诊断规则：
+
+- 每个健康 epoch 原子更新 `last_good_checkpoint.pth`。
+- 除下述 GradScaler 可恢复回退外，任何非有限 output、task loss、total loss、
+  affinity gradient/dot、grad norm、loss scale、参数或 buffer 都会立即中止。
+- GradScaler 初始 scale 过高时，若检测到 optimizer step 已被安全跳过且 scale
+  自动回退，会记录 `Recoverable AMP overflow` warning 后继续；scale 不回退的
+  非有限梯度、连续 16 次以上溢出或 scale 降到 1 以下仍会中止。
+- 日志以 `STAGE1_ABORTED` 结束，同时写 `failure_report.json`（多进程为
+  `failure_report_rankN.json`）和 `status: failed` 的
+  `stage1_artifacts.json`；报告包含 traceback、phase/epoch/batch/task、sample
+  IDs、有效标签比例、坏 tensor 统计、GPU 显存与运行时版本。
+- 只有日志以 `STAGE1_COMPLETED` 结束且 manifest 为 `status: complete` 的 run
+  才能进入 Step-2。
 
 ## 5. Shared rank 配置
 
@@ -274,6 +300,46 @@ python scripts/ag_mtlora_stage1_prepare.py \
   --resume-backbone backbone/swin_tiny_patch4_window7_224.pth
 ```
 
+#### 双进程独立搜索
+
+Stage-1 现在也支持与正式训练一致的双进程启动：
+
+```bash
+CUDA_VISIBLE_DEVICES=6,7 python -m torch.distributed.launch \
+  --nproc_per_node 2 \
+  --master_port 29501 \
+  scripts/ag_mtlora_stage1_prepare.py \
+  --cfg configs/mtlora/tiny_448/pascal/ag_mtlora_stage1_tiny_448_r64_scale4_pertask.yaml \
+  --pascal /path/to/PASCAL_MT \
+  --tasks semseg,normals,sal,human_parts \
+  --batch-size 24 \
+  --resume-backbone backbone/swin_tiny_patch4_window7_224.pth
+```
+
+也可使用等价的 `torchrun --nproc_per_node=2 --master_port=29501 ...`。脚本同时接受 launcher 注入的 `--local_rank` 和 `--local-rank`。
+
+双进程严格采用当前 UniPoRA 的独立进程语义：
+
+- 每个 rank 读取完整数据并独立执行 warmup、affinity 和分组搜索。
+- 不使用 DDP、`DistributedSampler`、梯度同步、affinity 平均或 grouping 合并。
+- 每个进程的 `--batch-size` 含义不变；rank `n` 使用 `config.SEED + n`。
+- rank 0 产物是后续正式训练的规范输入，其他 rank 产物用于稳定性诊断。
+
+输出会写入同一个 run 根目录下互不覆盖的 rank 子目录：
+
+```text
+output/<model_name>/<tag>/ag_mtlora_stage1_prepare/run_<timestamp>/
+├── rank_0/
+│   ├── resolved_agmtlora_config.yaml
+│   ├── post_affinity_checkpoint.pth
+│   └── stage1_artifacts.json
+├── rank_1/
+│   └── stage1_artifacts.json
+└── stage1_multi_process_manifest.json
+```
+
+正式训练应读取 `rank_0/resolved_agmtlora_config*.yaml`，如需继承 Stage-1 权重则同时读取 `rank_0/post_affinity_checkpoint.pth`。
+
 NYUD 四任务示例：
 
 ```bash
@@ -297,7 +363,23 @@ python scripts/ag_mtlora_stage1_prepare.py \
   --opts MODEL.AGMTLORA.SEARCH_SCORE_SOURCE group_proxy
 ```
 
-如果你已经有一个完整的 Stage-1 输出目录，并且只想复用已有 affinity / group proxy 重做 search，不重新跑 warmup、affinity 和 predictor chain，可以直接使用离线 replay 脚本：
+双进程续跑时仍用相同的 launcher，并把共享 run 根目录传给 `--resume-stage1-dir`：
+
+```bash
+CUDA_VISIBLE_DEVICES=6,7 python -m torch.distributed.launch \
+  --nproc_per_node 2 \
+  --master_port 29501 \
+  scripts/ag_mtlora_stage1_prepare.py \
+  --cfg configs/mtlora/tiny_448/pascal/ag_mtlora_stage1_tiny_448_r64_scale4_pertask.yaml \
+  --pascal /path/to/PASCAL_MT \
+  --tasks semseg,normals,sal,human_parts \
+  --resume-stage1-dir output/<model_name>/<tag>/ag_mtlora_stage1_prepare/run_<timestamp> \
+  --opts MODEL.AGMTLORA.SEARCH_SCORE_SOURCE group_proxy
+```
+
+每个进程会自动映射到自己的 `rank_<n>` 子目录；缺少相应 rank 目录时会报错。单进程续跑仍直接传原来的 Stage-1 输出目录。续跑只接受带有当前数值稳定性 schema、有限 state/affinity 和已通过 AMP smoke test 的新产物；修复前目录会立即失败并写诊断报告，不能借续跑入口重新标成成功。
+
+如果你已经有一个通过当前数值稳定性验收的完整 Stage-1 输出目录，并且只想复用已有 affinity / group proxy 重做 search，不重新跑 warmup、affinity 和 predictor chain，可以直接使用离线 replay 脚本。replay 同样拒绝缺少当前 schema 的旧搜索产物：
 
 ```bash
 python scripts/ag_mtlora_stage1_replay_search.py \

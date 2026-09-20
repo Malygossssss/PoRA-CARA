@@ -90,11 +90,46 @@ python -m torch.distributed.launch --nproc_per_node 1 main.py \
   --resume-backbone backbone/swin_tiny_patch4_window7_224.pth
 ```
 
-# Single GPU (backward compatible)
+### Process launch semantics
+
+```bash
+# Single process
 torchrun --nproc_per_node=1 main.py --cfg configs/... --tasks semseg,normals,sal,human_parts ...
 
-# Multi GPU
-torchrun --nproc_per_node=4 main.py --cfg configs/... --tasks semseg,normals,sal,human_parts ...
+# Two independent GPU processes (aligned with UniPoRA)
+CUDA_VISIBLE_DEVICES=6,7 torchrun --nproc_per_node=2 --master_port=29501 \
+  main.py --cfg configs/... --tasks semseg,normals,sal,human_parts ...
+```
+
+The multi-process command intentionally matches the current UniPoRA training
+semantics. It does **not** wrap the model with `DistributedDataParallel` and it
+does **not** shard the MTL dataset. Every rank trains an independent model over
+the complete dataset; only the rank-0 model is written by the checkpoint path.
+`DATA.BATCH_SIZE` remains the batch size used by each independent process, while
+the learning-rate scaling formula still includes `WORLD_SIZE`, as in UniPoRA.
+
+Stage-1 grouping search supports the same two-process launcher:
+
+```bash
+CUDA_VISIBLE_DEVICES=6,7 python -m torch.distributed.launch \
+  --nproc_per_node 2 --master_port 29501 \
+  scripts/ag_mtlora_stage1_prepare.py \
+  --cfg configs/mtlora/tiny_448/pascal/ag_mtlora_stage1_tiny_448_r64_scale4_pertask.yaml \
+  --pascal /path/to/PASCAL_MT \
+  --tasks semseg,normals,sal,human_parts \
+  --resume-backbone backbone/swin_tiny_patch4_window7_224.pth
+```
+
+Each rank performs a complete independent search with seed `SEED + rank` and
+writes to `run_<timestamp>/rank_<rank>/`. Rank 0 is canonical; use its resolved
+config and checkpoint for Step-2. No DDP, data sharding, gradient synchronization,
+or affinity averaging is performed. Single-process Stage-1 paths remain unchanged.
+Stage-1 applies the same runtime learning-rate scaling as `main.py`, then uses
+linear warmup/cosine decay, autocast, GradScaler, and gradient clipping. A run is
+valid only when its log ends with `STAGE1_COMPLETED` and its
+`stage1_artifacts.json` has `status: complete`. Failed runs end with
+`STAGE1_ABORTED` and persist `failure_report*.json` plus
+`last_good_checkpoint.pth`; do not pass their grouping or checkpoint to Step-2.
 
 ## Available Configs
 
@@ -112,12 +147,19 @@ Kept MTLoRA configs:
 - `configs/mtlora/tiny_448/nyud/ag_mtlora_stage1_tiny_448_r64_scale4_pertask_nyud.yaml`
 - `configs/mtlora/tiny_448/pascal/ag_mtlora_stage1_tiny_448_r64_scale4_pertask_stagewise_proxy.yaml`
 - `configs/mtlora/tiny_448/nyud/ag_mtlora_stage1_tiny_448_r64_scale4_pertask_nyud_stagewise_proxy.yaml`
+- `configs/mtlora/tiny_448/pascal/unipora_cara_tiny_448_r64_prom50_global_group_proxy_2lr.yaml`
 
 Standard Swin baselines are kept under `configs/swin/`.
 
 ## Utilities
 
 AG-MTLoRA Stage-1 specific workflow, search configuration, replay-search usage, and the new stage-wise partition mode are documented in `README_AG_MTLORA_STAGE1.md`.
+
+The recommended end-to-end UniPoRA-CARA workflow uses the inherited `_2lr.yaml`
+config above. The YAML keeps the raw learning rates; both Stage-1 and formal
+training scale all three fields once at runtime using
+`batch_size * WORLD_SIZE * accumulation_steps / 512`. See
+`README_UNIPORA_CARA.md`.
 
 Stage-wise partition example configs:
 

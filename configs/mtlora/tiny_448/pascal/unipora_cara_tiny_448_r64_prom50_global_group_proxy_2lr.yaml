@@ -1,0 +1,10 @@
+BASE:
+  - unipora_cara_tiny_448_r64_prom50_global_group_proxy.yaml
+
+MODEL:
+  NAME: unipora_cara_tiny_448_r64_prom50_global_group_proxy_2lr
+
+TRAIN:
+  BASE_LR: 1.0e-3
+  WARMUP_LR: 1.0e-6
+  MIN_LR: 1.0e-5

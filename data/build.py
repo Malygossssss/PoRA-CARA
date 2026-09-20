@@ -202,16 +202,10 @@ def build_transform(is_train, config):
 
 def build_mtl(config, db_name="NYUD", val_only=False):
     config.defrost()
-    num_tasks = dist.get_world_size()
-    global_rank = dist.get_rank()
-
     if val_only:
         _, val_transforms = get_transformations(db_name, config.TASKS_CONFIG)
         dataset_val = get_mtl_val_dataset(db_name, config, val_transforms)
-        sampler_val = torch.utils.data.DistributedSampler(
-            dataset_val, num_replicas=num_tasks, rank=global_rank, shuffle=False
-        ) if num_tasks > 1 else None
-        data_loader_val = get_mtl_val_dataloader(config, dataset_val, sampler=sampler_val)
+        data_loader_val = get_mtl_val_dataloader(config, dataset_val)
         return dataset_val, data_loader_val
 
     print(f"Loading {db_name} dataset")
@@ -222,16 +216,8 @@ def build_mtl(config, db_name="NYUD", val_only=False):
     dataset_train = get_mtl_train_dataset(
         db_name, config, train_transforms)
     dataset_val = get_mtl_val_dataset(db_name, config, val_transforms)
-
-    sampler_train = torch.utils.data.DistributedSampler(
-        dataset_train, num_replicas=num_tasks, rank=global_rank, shuffle=True
-    ) if num_tasks > 1 else None
-    sampler_val = torch.utils.data.DistributedSampler(
-        dataset_val, num_replicas=num_tasks, rank=global_rank, shuffle=False
-    ) if num_tasks > 1 else None
-
-    data_loader_train = get_mtl_train_dataloader(config, dataset_train, sampler=sampler_train)
-    data_loader_val = get_mtl_val_dataloader(config, dataset_val, sampler=sampler_val)
+    data_loader_train = get_mtl_train_dataloader(config, dataset_train)
+    data_loader_val = get_mtl_val_dataloader(config, dataset_val)
     mixup_fn = None
 
     return dataset_train, dataset_val, data_loader_train, data_loader_val, mixup_fn
