@@ -324,6 +324,10 @@ def main(config):
                            for p in model.parameters() if p.requires_grad)
     lora_params = sum(p.numel() for name, p in model.named_parameters()
                       if p.requires_grad and 'lora' in name)
+    rank_extractor_params = sum(
+        p.numel() for name, p in model.named_parameters()
+        if 'lora_rank_extractors' in name
+    )
     total_model_params = sum(p.numel() for p in model.parameters())
     total_model_params_without_lora = total_model_params - lora_params
     decoder_params = sum(p.numel() for name, p in model.named_parameters()
@@ -332,6 +336,7 @@ def main(config):
     logger.info(
         f"\nNumber of trainable params: {trainable_params:,}\n"
         f"Decoder params:             {decoder_params:,}\n"
+        f"Rank extractor params:       {rank_extractor_params:,}\n"
         f"LoRA params:                {lora_params:,}\n"
         f"Extra params:                {(trainable_params - (lora_params + decoder_params)):,}\n"
         f"Total params:               {total_model_params:,} (trainable ratio: {trainable_params/total_model_params * 100:2.2f}%)\n"

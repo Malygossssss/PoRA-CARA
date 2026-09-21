@@ -1,3 +1,4 @@
+import json
 import os
 import tempfile
 import unittest
@@ -8,8 +9,19 @@ from yacs.config import CfgNode as CN
 
 from config import get_config
 from models.build import build_model
-from models.lora import MTLoRALinear, mark_only_lora_as_trainable, mark_prompt_as_trainable
-from models.swin_transformer_vpt import PromptedSwinTransformer, PromptedWindowAttention
+from models.lora import (
+    MTLoRALinear,
+    RankExtractionGate,
+    mark_only_lora_as_trainable,
+    mark_prompt_as_trainable,
+)
+from models.swin_transformer_vpt import (
+    PromptedSwinTransformer,
+    PromptedWindowAttention,
+    _aggregate_prompt_windows,
+    _expand_prompt_windows,
+)
+from utils import _rank_extract_checkpoint_mode
 
 
 TASKS = ["semseg", "sal"]
@@ -86,6 +98,44 @@ MODEL:
 """
 
 
+def make_rank_extract_yaml(grouping_json, grouping_source="fixed_json", task_rank=0):
+    return f"""
+DATA:
+  IMG_SIZE: 32
+MODEL:
+  TYPE: swin
+  NAME: rank_extract_test
+  MTLORA:
+    ENABLED: True
+    R: [4]
+    SHARED_SCALE: [1.0]
+    TASK_SCALE: [1.0]
+    DROPOUT: [0.0]
+    R_PER_TASK:
+      semseg: [{task_rank}]
+      sal: [{task_rank}]
+      shared: [4]
+    RANK_EXTRACT:
+      ENABLED: True
+      STAGES: [2, 3]
+      MODULES: [fc1]
+      BLOCKS: all
+      HIDDEN_DIM: 16
+  PROMPT:
+    ENABLED: True
+    NUM_TOKENS: 2
+    DEEP: True
+    LOCATION: prepend
+    DROPOUT: 0.0
+    INITIATION: random
+  AGMTLORA:
+    ENABLED: True
+    GROUPING_SOURCE: {grouping_source}
+    GROUPING_JSON: {json.dumps(grouping_json)}
+    GROUP_SHARED_RANKS: [[2], [2]]
+"""
+
+
 def make_mtlora(tasks=TASKS, ag_enabled=False):
     depths = [1, 1, 1, 1]
     cfg = CN(new_allowed=True)
@@ -125,6 +175,12 @@ def make_mtlora(tasks=TASKS, ag_enabled=False):
     cfg.AGMTLORA_GROUP_RANKS = []
     cfg.AGMTLORA_TASK_TO_GROUP = CN(new_allowed=True)
     cfg.AGMTLORA_TASK_TO_GROUP_BY_STAGE = CN(new_allowed=True)
+    cfg.RANK_EXTRACT = CN()
+    cfg.RANK_EXTRACT.ENABLED = False
+    cfg.RANK_EXTRACT.STAGES = [2, 3]
+    cfg.RANK_EXTRACT.MODULES = ["fc1"]
+    cfg.RANK_EXTRACT.BLOCKS = "all"
+    cfg.RANK_EXTRACT.HIDDEN_DIM = 16
     if ag_enabled:
         cfg.AGMTLORA_GROUP_NAMES = ["group_0", "group_1"]
         cfg.AGMTLORA_GROUP_RANKS = [[2, 2, 2, 2], [2, 2, 2, 2]]
@@ -171,6 +227,33 @@ def make_model_config(ag_enabled=False):
 
 
 class MTLoRAPromptTest(unittest.TestCase):
+    def test_prompt_window_round_trip_preserves_batch_ownership(self):
+        prompt_emb = torch.tensor([[[0.0]], [[1.0]]])
+
+        prompt_windows = _expand_prompt_windows(prompt_emb, num_windows=3)
+
+        torch.testing.assert_close(
+            prompt_windows[:, 0, 0],
+            torch.tensor([0.0, 0.0, 0.0, 1.0, 1.0, 1.0]),
+        )
+        aggregated = _aggregate_prompt_windows(
+            prompt_windows, batch_size=2, num_windows=3
+        )
+        torch.testing.assert_close(aggregated, prompt_emb)
+
+    def test_prompt_window_aggregation_keeps_task_branch_samples_independent(self):
+        task_prompt_windows = torch.tensor(
+            [[[10.0]], [[11.0]], [[12.0]], [[20.0]], [[21.0]], [[22.0]]]
+        )
+
+        aggregated = _aggregate_prompt_windows(
+            task_prompt_windows, batch_size=2, num_windows=3
+        )
+
+        torch.testing.assert_close(
+            aggregated[:, 0, 0], torch.tensor([11.0, 21.0])
+        )
+
     def test_config_accepts_minimal_prompt(self):
         with tempfile.TemporaryDirectory() as tmp_dir:
             cfg_path = os.path.join(tmp_dir, "prompt.yaml")
@@ -192,6 +275,42 @@ class MTLoRAPromptTest(unittest.TestCase):
             with self.assertRaisesRegex(ValueError, "LOCATION"):
                 get_config(make_args(cfg_path))
 
+    def test_config_accepts_rank_extraction_with_fixed_groups_and_zero_task_ranks(self):
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            grouping_path = os.path.join(tmp_dir, "grouping.json")
+            with open(grouping_path, "w", encoding="utf-8") as handle:
+                json.dump({"tasks": TASKS, "groups": [["semseg"], ["sal"]]}, handle)
+            cfg_path = os.path.join(tmp_dir, "rank_extract.yaml")
+            with open(cfg_path, "w", encoding="utf-8") as handle:
+                handle.write(make_rank_extract_yaml(grouping_path))
+
+            cfg = get_config(make_args(cfg_path))
+
+        self.assertTrue(cfg.MODEL.MTLORA.RANK_EXTRACT.ENABLED)
+        self.assertEqual(cfg.MODEL.MTLORA.RANK_EXTRACT.STAGES, [2, 3])
+        self.assertTrue(cfg.MODEL.MTLORA.AGMTLORA_ENABLED)
+
+    def test_config_rejects_rank_extraction_during_group_search(self):
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            cfg_path = os.path.join(tmp_dir, "rank_extract.yaml")
+            with open(cfg_path, "w", encoding="utf-8") as handle:
+                handle.write(make_rank_extract_yaml("", grouping_source="search"))
+
+            with self.assertRaisesRegex(ValueError, "fixed_json"):
+                get_config(make_args(cfg_path))
+
+    def test_config_rejects_rank_extraction_with_task_lora(self):
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            grouping_path = os.path.join(tmp_dir, "grouping.json")
+            with open(grouping_path, "w", encoding="utf-8") as handle:
+                json.dump({"tasks": TASKS, "groups": [["semseg"], ["sal"]]}, handle)
+            cfg_path = os.path.join(tmp_dir, "rank_extract.yaml")
+            with open(cfg_path, "w", encoding="utf-8") as handle:
+                handle.write(make_rank_extract_yaml(grouping_path, task_rank=1))
+
+            with self.assertRaisesRegex(ValueError, "task-specific LoRA rank"):
+                get_config(make_args(cfg_path))
+
     def test_build_model_uses_prompted_swin_when_enabled(self):
         model = build_model(make_model_config())
 
@@ -207,6 +326,48 @@ class MTLoRAPromptTest(unittest.TestCase):
 
         self.assertEqual(len(features), 4)
         self.assertEqual([feature.shape[1] for feature in features], [16, 4, 1, 1])
+
+    def test_prompted_backbone_eval_is_batch_and_reorder_independent(self):
+        model = build_model(make_model_config(ag_enabled=True))
+        model.eval()
+        images = torch.randn(2, 3, 32, 32)
+
+        with torch.no_grad():
+            batched = model(images, task="semseg", return_stages=True)
+            reordered = model(images.flip(0), task="semseg", return_stages=True)
+            singles = [
+                model(images[index:index + 1], task="semseg", return_stages=True)
+                for index in range(2)
+            ]
+
+        for stage_idx, batched_stage in enumerate(batched):
+            torch.testing.assert_close(batched_stage[0:1], singles[0][stage_idx])
+            torch.testing.assert_close(batched_stage[1:2], singles[1][stage_idx])
+            torch.testing.assert_close(batched_stage, reordered[stage_idx].flip(0))
+
+    def test_prompted_backbone_builds_rank_extractors_only_for_target_fc1_stages(self):
+        config = make_model_config(ag_enabled=True)
+        config.MODEL.MTLORA.defrost()
+        for stage_ranks in config.MODEL.MTLORA.R_PER_TASK_LIST:
+            for task in TASKS:
+                stage_ranks[task] = 0
+        config.MODEL.MTLORA.RANK_EXTRACT.ENABLED = True
+        config.MODEL.MTLORA.RANK_EXTRACT.STAGES = [2, 3]
+        config.MODEL.MTLORA.RANK_EXTRACT.HIDDEN_DIM = 16
+        config.MODEL.MTLORA.freeze()
+
+        model = build_model(config)
+        target_linears = [
+            module for module in model.modules()
+            if isinstance(module, MTLoRALinear) and module.rank_extract_enabled
+        ]
+        gates = [module for module in model.modules() if isinstance(module, RankExtractionGate)]
+
+        self.assertEqual(len(target_linears), 2)
+        self.assertTrue(all(set(module.lora_rank_extractors) == {"group_0", "group_1"}
+                            for module in target_linears))
+        self.assertEqual(len(gates), 4)
+        self.assertEqual(sum(param.numel() for gate in gates for param in gate.parameters()), 456)
 
     def test_prompt_attention_keeps_ag_task_qkv_branches(self):
         attention = PromptedWindowAttention(
@@ -258,6 +419,191 @@ class MTLoRAPromptTest(unittest.TestCase):
         torch.testing.assert_close(selected_task_outputs["sal"], all_task_outputs["sal"])
         with self.assertRaisesRegex(ValueError, "active_task"):
             layer(x, active_task="unknown")
+
+    def test_rank_extraction_gate_initializes_to_exact_identity(self):
+        gate = RankExtractionGate(rank=3, hidden_dim=5)
+        rank_activations = torch.randn(2, 4, 3)
+        condition = torch.randn(2, 3)
+
+        mask = gate(rank_activations, condition)
+
+        torch.testing.assert_close(mask, torch.ones_like(mask), rtol=0.0, atol=0.0)
+
+    def test_rank_extraction_identity_matches_group_lora_baseline(self):
+        layer = MTLoRALinear(
+            4,
+            6,
+            r={"group_0": 2, "group_1": 3},
+            lora_shared_scale=1.25,
+            lora_dropout=0.0,
+            tasks=TASKS,
+            task_to_group={"semseg": "group_0", "sal": "group_1"},
+            rank_extract_enabled=True,
+            rank_extract_hidden_dim=4,
+        )
+        with torch.no_grad():
+            for group in layer.lora_shared_B_groups.values():
+                group.normal_()
+        x = torch.randn(2, 5, 4)
+        x_tasks = {"semseg": torch.randn(2, 5, 4)}
+
+        layer.rank_extract_enabled = False
+        _, baseline = layer(x, x_tasks, active_task="semseg", prompt_token_count=2)
+        layer.rank_extract_enabled = True
+        _, extracted = layer(x, x_tasks, active_task="semseg", prompt_token_count=2)
+
+        torch.testing.assert_close(extracted["semseg"], baseline["semseg"])
+
+    def test_rank_extraction_identity_preserves_training_dropout_sequence(self):
+        layer = MTLoRALinear(
+            4,
+            6,
+            r={"group_0": 2},
+            lora_shared_scale=1.0,
+            lora_dropout=0.4,
+            tasks=["semseg"],
+            task_to_group={"semseg": "group_0"},
+            rank_extract_enabled=True,
+        )
+        layer.train()
+        with torch.no_grad():
+            layer.lora_shared_B_groups["group_0"].normal_()
+        x = torch.randn(2, 5, 4)
+        task_input = torch.randn(2, 5, 4)
+
+        layer.rank_extract_enabled = False
+        torch.manual_seed(17)
+        _, baseline = layer(x, {"semseg": task_input}, active_task="semseg", prompt_token_count=2)
+        layer.rank_extract_enabled = True
+        torch.manual_seed(17)
+        _, extracted = layer(x, {"semseg": task_input}, active_task="semseg", prompt_token_count=2)
+
+        torch.testing.assert_close(extracted["semseg"], baseline["semseg"])
+
+    def test_rank_extraction_changes_only_patch_group_residual(self):
+        layer = MTLoRALinear(
+            3,
+            4,
+            r={"group_0": 2},
+            lora_shared_scale=1.0,
+            lora_dropout=0.0,
+            tasks=["semseg"],
+            task_to_group={"semseg": "group_0"},
+            rank_extract_enabled=True,
+            rank_extract_hidden_dim=3,
+        )
+        with torch.no_grad():
+            layer.lora_shared_B_groups["group_0"].normal_()
+        x = torch.randn(1, 5, 3)
+        task_input = torch.randn(1, 5, 3)
+
+        _, identity_output = layer(
+            x,
+            {"semseg": task_input},
+            active_task="semseg",
+            prompt_token_count=2,
+        )
+        with torch.no_grad():
+            layer.lora_rank_extractors["group_0"].output.bias.fill_(1.0)
+        _, modulated_output = layer(
+            x,
+            {"semseg": task_input},
+            active_task="semseg",
+            prompt_token_count=2,
+        )
+
+        torch.testing.assert_close(
+            modulated_output["semseg"][:, :2], identity_output["semseg"][:, :2]
+        )
+        self.assertFalse(torch.allclose(
+            modulated_output["semseg"][:, 2:], identity_output["semseg"][:, 2:]
+        ))
+
+    def test_rank_extraction_gate_responds_to_condition_and_rank_activation(self):
+        gate = RankExtractionGate(rank=2, hidden_dim=2)
+        with torch.no_grad():
+            gate.z_proj.weight.copy_(torch.eye(2))
+            gate.condition_proj.weight.copy_(torch.eye(2))
+            gate.output.weight.copy_(torch.eye(2))
+        z = torch.tensor([[[1.0, 0.0], [0.0, 1.0]]])
+        condition = torch.tensor([[1.0, -1.0]])
+
+        base = gate(z, condition)
+        changed_condition = gate(z, torch.tensor([[-1.0, 1.0]]))
+        changed_z = gate(z.flip(1), condition)
+
+        self.assertFalse(torch.allclose(base, changed_condition))
+        self.assertFalse(torch.allclose(base, changed_z))
+
+    def test_rank_extraction_gradients_follow_only_selected_group(self):
+        layer = MTLoRALinear(
+            3,
+            4,
+            r={"group_0": 2, "group_1": 3},
+            lora_shared_scale=1.0,
+            lora_dropout=0.0,
+            tasks=TASKS,
+            task_to_group={"semseg": "group_0", "sal": "group_1"},
+            rank_extract_enabled=True,
+            rank_extract_hidden_dim=3,
+        )
+        with torch.no_grad():
+            layer.lora_shared_B_groups["group_0"].normal_()
+            layer.lora_rank_extractors["group_0"].output.weight.normal_()
+        shared_input = torch.randn(1, 5, 3)
+        task_input = torch.randn(1, 5, 3, requires_grad=True)
+
+        _, outputs = layer(
+            shared_input,
+            {"semseg": task_input},
+            active_task="semseg",
+            prompt_token_count=2,
+        )
+        outputs["semseg"][:, 2:].sum().backward()
+
+        self.assertGreater(task_input.grad[:, :2].abs().sum().item(), 0.0)
+        self.assertIsNotNone(layer.lora_rank_extractors["group_0"].output.weight.grad)
+        self.assertIsNone(layer.lora_rank_extractors["group_1"].output.weight.grad)
+        self.assertIsNone(layer.lora_shared_A_groups["group_1"].grad)
+        extractor_parameter_ids = {
+            id(parameter)
+            for parameter in layer.lora_rank_extractors.parameters()
+        }
+        self.assertNotIn(id(layer.lora_shared_A_groups["group_0"]), extractor_parameter_ids)
+
+    def test_rank_extraction_rejects_missing_prompt_or_task_route(self):
+        layer = MTLoRALinear(
+            3,
+            4,
+            r={"group_0": 2},
+            tasks=["semseg"],
+            task_to_group={"semseg": "group_0"},
+            rank_extract_enabled=True,
+        )
+        x = torch.randn(1, 4, 3)
+        with self.assertRaisesRegex(ValueError, "active_task"):
+            layer(x, prompt_token_count=1)
+        with self.assertRaisesRegex(ValueError, "prompt_token_count"):
+            layer(x, active_task="semseg", prompt_token_count=0)
+
+    def test_rank_extraction_checkpoint_modes_distinguish_init_and_resume(self):
+        target_state = {
+            "backbone.fc1.lora_rank_extractors.group_0.output.weight": object(),
+            "backbone.fc1.lora_rank_extractors.group_0.output.bias": object(),
+        }
+
+        mode, missing = _rank_extract_checkpoint_mode({}, target_state)
+        self.assertEqual(mode, "initialization")
+        self.assertEqual(missing, set(target_state))
+
+        mode, missing = _rank_extract_checkpoint_mode(dict(target_state), target_state)
+        self.assertEqual(mode, "resume")
+        self.assertEqual(missing, set(target_state))
+
+        with self.assertRaisesRegex(RuntimeError, "does not match"):
+            _rank_extract_checkpoint_mode(
+                {next(iter(target_state)): object()}, target_state
+            )
 
     def test_prompt_attention_active_task_computes_only_selected_branch(self):
         attention = PromptedWindowAttention(

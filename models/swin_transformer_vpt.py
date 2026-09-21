@@ -14,6 +14,8 @@ from torch.nn import Dropout
 
 from timm.models.layers import to_2tuple
 
+from .lora import RankExtractionGate
+
 from .swin_transformer_mtlora import (
     PatchMerging,
     SwinTransformerBlock,
@@ -22,6 +24,34 @@ from .swin_transformer_mtlora import (
     window_partition,
     window_reverse,
 )
+
+
+def _expand_prompt_windows(prompt_emb, num_windows):
+    """Repeat each sample's prompts for its own batch-major Swin windows."""
+    if prompt_emb.ndim != 3:
+        raise ValueError("prompt_emb must have shape [B, P, C].")
+    if int(num_windows) <= 0:
+        raise ValueError("num_windows must be positive.")
+    batch_size, prompt_count, channels = prompt_emb.shape
+    return (
+        prompt_emb[:, None]
+        .expand(batch_size, int(num_windows), prompt_count, channels)
+        .reshape(batch_size * int(num_windows), prompt_count, channels)
+    )
+
+
+def _aggregate_prompt_windows(prompt_windows, batch_size, num_windows):
+    """Average prompts over windows without mixing samples."""
+    if prompt_windows.ndim != 3:
+        raise ValueError("prompt_windows must have shape [B * nW, P, C].")
+    expected = int(batch_size) * int(num_windows)
+    if prompt_windows.shape[0] != expected:
+        raise ValueError(
+            f"Expected {expected} prompt windows, got {prompt_windows.shape[0]}."
+        )
+    return prompt_windows.reshape(
+        int(batch_size), int(num_windows), prompt_windows.shape[1], prompt_windows.shape[2]
+    ).mean(dim=1)
 
 
 class PromptedSwinTransformer(SwinTransformerMTLoRA):
@@ -132,6 +162,12 @@ class PromptedSwinTransformer(SwinTransformerMTLoRA):
                     nn.init.uniform_(emb, -val, val)
                 prompt_dict[task] = nn.Parameter(emb)
             self.deep_prompt_embeddings.append(prompt_dict)
+
+        # The model-wide initializer may touch nested Linear modules. Re-assert
+        # the gate's exact identity output only after construction is complete.
+        for module in self.modules():
+            if isinstance(module, RankExtractionGate):
+                module.reset_output_identity()
 
     def forward(self, x, task=None, return_stages=False, flatten_ft=False):
         if task is None:
@@ -395,8 +431,7 @@ class PromptedSwinTransformerBlock(SwinTransformerBlock):
         x_windows = x_windows.view(-1, self.window_size * self.window_size, C)
 
         num_windows = int(x_windows.shape[0] / B)
-        prompt_windows = prompt_emb.unsqueeze(0).expand(num_windows, -1, -1, -1)
-        prompt_windows = prompt_windows.reshape((-1, prompt_count, C))
+        prompt_windows = _expand_prompt_windows(prompt_emb, num_windows)
         x_windows = torch.cat((prompt_windows, x_windows), dim=1)
 
         attn_windows, attn_windows_lora_tasks = self.attn(
@@ -407,13 +442,15 @@ class PromptedSwinTransformerBlock(SwinTransformerBlock):
 
         prompt_emb = attn_windows[:, :prompt_count, :]
         attn_windows = attn_windows[:, prompt_count:, :]
-        prompt_emb = prompt_emb.view(-1, B, prompt_count, C).mean(0)
+        prompt_emb = _aggregate_prompt_windows(prompt_emb, B, num_windows)
 
         prompt_emb_lora_tasks = {}
         if attn_windows_lora_tasks is not None:
             for task in attn_windows_lora_tasks.keys():
                 prompt_task = attn_windows_lora_tasks[task][:, :prompt_count, :]
-                prompt_emb_lora_tasks[task] = prompt_task.view(-1, B, prompt_count, C).mean(0)
+                prompt_emb_lora_tasks[task] = _aggregate_prompt_windows(
+                    prompt_task, B, num_windows
+                )
                 attn_windows_lora_tasks[task] = attn_windows_lora_tasks[task][:, prompt_count:, :]
 
         attn_windows = attn_windows.view(-1, self.window_size, self.window_size, C)
@@ -450,6 +487,7 @@ class PromptedSwinTransformerBlock(SwinTransformerBlock):
             self.norm2(x),
             mlp_inputs,
             active_task=active_task,
+            prompt_token_count=prompt_count,
         )
         if mlp_lora_tasks is None:
             return x + self.drop_path(mlp_result), None

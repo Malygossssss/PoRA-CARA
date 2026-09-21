@@ -384,6 +384,12 @@ _C.MODEL.MTLORA.AGMTLORA_GROUP_NAMES = []
 _C.MODEL.MTLORA.AGMTLORA_GROUP_RANKS = []
 _C.MODEL.MTLORA.AGMTLORA_TASK_TO_GROUP = CN(new_allowed=True)
 _C.MODEL.MTLORA.AGMTLORA_TASK_TO_GROUP_BY_STAGE = CN(new_allowed=True)
+_C.MODEL.MTLORA.RANK_EXTRACT = CN()
+_C.MODEL.MTLORA.RANK_EXTRACT.ENABLED = False
+_C.MODEL.MTLORA.RANK_EXTRACT.STAGES = [2, 3]
+_C.MODEL.MTLORA.RANK_EXTRACT.MODULES = ['fc1']
+_C.MODEL.MTLORA.RANK_EXTRACT.BLOCKS = 'all'
+_C.MODEL.MTLORA.RANK_EXTRACT.HIDDEN_DIM = 16
 
 _C.MODEL.AGMTLORA = CN()
 _C.MODEL.AGMTLORA.ENABLED = False
@@ -445,6 +451,74 @@ def _update_config_from_file(config, cfg_file):
     print('=> merge config from {}'.format(cfg_file))
     config.merge_from_other_cfg(CN(yaml_cfg))
     config.freeze()
+
+
+def _validate_rank_extract_config(config):
+    rank_extract = config.MODEL.MTLORA.RANK_EXTRACT
+    if not bool(rank_extract.ENABLED):
+        return
+    if not bool(config.MODEL.MTLORA.ENABLED):
+        raise ValueError("RANK_EXTRACT.ENABLED=True requires MODEL.MTLORA.ENABLED=True.")
+    if not bool(config.MODEL.PROMPT.ENABLED):
+        raise ValueError("RANK_EXTRACT.ENABLED=True requires MODEL.PROMPT.ENABLED=True.")
+    if not bool(config.MODEL.MTLORA.FC1_ENABLED):
+        raise ValueError("Rank extraction requires MODEL.MTLORA.FC1_ENABLED=True.")
+    if str(config.MODEL.MTLORA.SHARED_MODE) != 'matrix':
+        raise ValueError("Rank extraction requires MODEL.MTLORA.SHARED_MODE='matrix'.")
+    if str(config.MODEL.AGMTLORA.GROUPING_SOURCE) != 'fixed_json':
+        raise ValueError("Rank extraction is only supported with AGMTLORA.GROUPING_SOURCE='fixed_json'.")
+    if not bool(config.MODEL.MTLORA.AGMTLORA_ENABLED):
+        raise ValueError("Rank extraction requires resolved AG-MTLoRA groups.")
+
+    stages = [int(stage) for stage in rank_extract.STAGES]
+    if not stages or len(stages) != len(set(stages)):
+        raise ValueError("RANK_EXTRACT.STAGES must contain unique stage indices.")
+    num_stages = len(config.MODEL.SWIN.DEPTHS)
+    if any(stage < 0 or stage >= num_stages for stage in stages):
+        raise ValueError(f"RANK_EXTRACT.STAGES must be within [0, {num_stages - 1}].")
+    rank_extract.STAGES = stages
+
+    modules = [str(module).lower() for module in rank_extract.MODULES]
+    if modules != ['fc1']:
+        raise ValueError("RANK_EXTRACT.MODULES must be exactly ['fc1'] in v1.")
+    rank_extract.MODULES = modules
+    blocks = str(rank_extract.BLOCKS).lower()
+    if blocks not in {'all', 'stage_last'}:
+        raise ValueError("RANK_EXTRACT.BLOCKS must be 'all' or 'stage_last'.")
+    rank_extract.BLOCKS = blocks
+    if int(rank_extract.HIDDEN_DIM) <= 0:
+        raise ValueError("RANK_EXTRACT.HIDDEN_DIM must be positive.")
+
+    nonzero_task_ranks = {
+        task: list(config.MODEL.MTLORA.R_PER_TASK[task])
+        for task in config.TASKS
+        if any(int(rank) != 0 for rank in config.MODEL.MTLORA.R_PER_TASK[task])
+    }
+    if nonzero_task_ranks:
+        raise ValueError(
+            "Rank extraction v1 requires every task-specific LoRA rank to be zero; "
+            f"got {nonzero_task_ranks}."
+        )
+
+    group_names = list(config.MODEL.MTLORA.AGMTLORA_GROUP_NAMES)
+    group_ranks = list(config.MODEL.MTLORA.AGMTLORA_GROUP_RANKS)
+    group_indices = {name: idx for idx, name in enumerate(group_names)}
+    stage_mappings = config.MODEL.MTLORA.AGMTLORA_TASK_TO_GROUP_BY_STAGE
+    global_mapping = config.MODEL.MTLORA.AGMTLORA_TASK_TO_GROUP
+    for stage in stages:
+        stage_key = f"stage_{stage}"
+        mapping = stage_mappings[stage_key] if stage_key in stage_mappings else global_mapping
+        for task in config.TASKS:
+            if task not in mapping:
+                raise ValueError(f"Task {task!r} has no AG-MTLoRA mapping for stage {stage}.")
+            group_name = str(mapping[task])
+            if group_name not in group_indices:
+                raise ValueError(f"Unknown AG-MTLoRA group {group_name!r} at stage {stage}.")
+            group_idx = group_indices[group_name]
+            if int(group_ranks[group_idx][stage]) <= 0:
+                raise ValueError(
+                    f"Rank extraction requires a positive rank for {group_name!r} at stage {stage}."
+                )
 
 
 def update_config(config, args):
@@ -859,6 +933,7 @@ def update_config(config, args):
                 config.MODEL.MTLORA.AGMTLORA_TASK_TO_GROUP_BY_STAGE[stage_key] = CN(new_allowed=True)
                 for task, group_name in task_to_group.items():
                     config.MODEL.MTLORA.AGMTLORA_TASK_TO_GROUP_BY_STAGE[stage_key][task] = group_name
+    _validate_rank_extract_config(config)
     config.freeze()
 
 

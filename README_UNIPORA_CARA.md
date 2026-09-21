@@ -267,6 +267,35 @@ Swin backbone
 - `MultiTaskSwin.forward()` 会对每个 task 调用 prompted backbone，因此每个 task 使用自己的 prompt 前向。
 - decoder heads 仍然是每个 task 独立的，并且默认参与训练。
 
+### 5.1 修正后的 E0 与 prompt-conditioned rank extraction（E4）
+
+Prompt window 现在严格按照 `window_partition()` 的 batch-major 顺序展开和回聚。旧 Stage-1 产物使用旧窗口语义，不应作为新实验的公平基线；运行时 schema 已升级，需先重新运行 Stage-1，生成新的 grouping 与 `post_affinity_checkpoint.pth`。
+
+仓库提供两个固定分组实验入口：
+
+- `configs/mtlora/tiny_448/pascal/unipora_cara_tiny_448_r64_prom50_corrected_e0.yaml`：修正窗口后的 E0，rank extractor 关闭。
+- `configs/mtlora/tiny_448/pascal/unipora_cara_tiny_448_r64_prom50_rank_extract_e4.yaml`：E4，在零起始 stage `[2, 3]` 的所有 block 上，仅调制 fc1 的 group-shared LoRA patch rank 激活。
+
+两个配置都故意把 `GROUPING_JSON` 留空，启动时必须指向同一次新 Stage-1 运行产生的 grouping。示例：
+
+```powershell
+$STAGE1_DIR = 'output\<MODEL.NAME>\<TAG>\ag_mtlora_stage1_prepare\run_<timestamp>\rank_0'
+$GROUPING_JSON = (Resolve-Path "$STAGE1_DIR\grouping__group_proxy.json").Path
+
+torchrun --nproc_per_node=1 main.py `
+  --cfg configs\mtlora\tiny_448\pascal\unipora_cara_tiny_448_r64_prom50_rank_extract_e4.yaml `
+  --pascal D:\path\to\PASCAL_MT `
+  --tasks semseg,normals,sal,human_parts `
+  --batch-size 8 `
+  --epochs 300 `
+  --resume "$STAGE1_DIR\post_affinity_checkpoint.pth" `
+  --opts MODEL.AGMTLORA.GROUPING_JSON "$GROUPING_JSON"
+```
+
+E0 使用同一命令，只替换 `--cfg`。两者必须共享 grouping、rank budget、初始化 checkpoint、训练时长、学习率和数据划分。
+
+E4 的 gate 输出头以零初始化，因此初始 mask 精确为 1。加载旧 Stage-1 或 extractor-off 正式训练权重时，只允许新增的 `lora_rank_extractors.*` keys 缺失，并重新建立 optimizer、scheduler、scaler 与起始 epoch；只有同结构、同分组、同 rank 的 E4 checkpoint 才执行完整训练状态恢复。日志会单独报告 `Rank extractor params`。
+
 ## 6. 评估
 
 训练完成后，使用同一个 resolved config 和正式训练 checkpoint 评估：

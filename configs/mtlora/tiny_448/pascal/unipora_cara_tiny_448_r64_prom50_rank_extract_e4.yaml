@@ -1,0 +1,15 @@
+BASE: ['unipora_cara_tiny_448_r64_prom50_global_group_proxy_2lr.yaml']
+
+MODEL:
+  NAME: unipora_cara_tiny_448_r64_prom50_rank_extract_e4
+  MTLORA:
+    RANK_EXTRACT:
+      ENABLED: True
+      STAGES: [2, 3]
+      MODULES: [fc1]
+      BLOCKS: all
+      HIDDEN_DIM: 16
+  AGMTLORA:
+    GROUPING_SOURCE: fixed_json
+    GROUPING_JSON: ''
+    GROUP_SHARED_RANKS: []

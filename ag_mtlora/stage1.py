@@ -16,6 +16,7 @@ from yacs.config import CfgNode as CN
 
 from ag_mtlora.config_utils import (
     DEFAULT_PARTITION_GRANULARITY,
+    PROMPT_WINDOW_LAYOUT_VERSION,
     STAGE1_RUNTIME_SCHEMA_VERSION,
     build_task_to_group_by_stage,
     build_task_to_group,
@@ -731,6 +732,12 @@ def maybe_load_affinity_result_from_existing_artifacts(config: CN, output_root: 
             f"numerical-stability contract (found schema={runtime_schema_version}, "
             f"required={STAGE1_RUNTIME_SCHEMA_VERSION}). Start a clean Stage-1 run "
             "from the original backbone checkpoint."
+        )
+    prompt_window_layout = post_extra_state.get("prompt_window_layout_version")
+    if prompt_window_layout != PROMPT_WINDOW_LAYOUT_VERSION:
+        raise RuntimeError(
+            "Refusing to resume Stage-1 artifacts with an incompatible prompt window layout "
+            f"(found={prompt_window_layout!r}, required={PROMPT_WINDOW_LAYOUT_VERSION!r})."
         )
     if not isinstance(post_extra_state.get("amp_smoke_test"), dict):
         raise RuntimeError(
@@ -1449,6 +1456,7 @@ def warmup_and_collect_affinity(
                 "selection_data_split_mode": selection_data_split_mode,
                 "meta_split_path": meta_split_path,
                 "stage1_runtime_schema_version": STAGE1_RUNTIME_SCHEMA_VERSION,
+                "prompt_window_layout_version": PROMPT_WINDOW_LAYOUT_VERSION,
             },
         },
         warmup_checkpoint_path,
@@ -1697,6 +1705,7 @@ def warmup_and_collect_affinity(
                 "meta_split_path": meta_split_path,
                 "amp_smoke_test": smoke_result,
                 "stage1_runtime_schema_version": STAGE1_RUNTIME_SCHEMA_VERSION,
+                "prompt_window_layout_version": PROMPT_WINDOW_LAYOUT_VERSION,
             },
         },
         post_affinity_checkpoint_path,
@@ -2155,6 +2164,7 @@ def write_search_artifacts(
 
         grouping_payload = {
             "stage1_runtime_schema_version": STAGE1_RUNTIME_SCHEMA_VERSION,
+            "prompt_window_layout_version": PROMPT_WINDOW_LAYOUT_VERSION,
             "tasks": list(tasks),
             "partition_granularity": partition_granularity,
             "group_slot_names": group_slot_names,
@@ -2225,6 +2235,7 @@ def write_search_artifacts(
         task_to_group = build_task_to_group(best_partition["groups"])
         grouping_payload = {
             "stage1_runtime_schema_version": STAGE1_RUNTIME_SCHEMA_VERSION,
+            "prompt_window_layout_version": PROMPT_WINDOW_LAYOUT_VERSION,
             "tasks": list(tasks),
             "partition_granularity": partition_granularity,
             "groups": best_partition["groups"],
@@ -2383,6 +2394,12 @@ def replay_stage1_partition_search(
             "Refusing to replay legacy Stage-1 search artifacts without the "
             f"numerical-stability contract (found schema={runtime_schema_version}, "
             f"required={STAGE1_RUNTIME_SCHEMA_VERSION})."
+        )
+    prompt_window_layout = grouping_payload.get("prompt_window_layout_version")
+    if prompt_window_layout != PROMPT_WINDOW_LAYOUT_VERSION:
+        raise RuntimeError(
+            "Refusing to replay Stage-1 artifacts with an incompatible prompt window layout "
+            f"(found={prompt_window_layout!r}, required={PROMPT_WINDOW_LAYOUT_VERSION!r})."
         )
 
     score_file_path = (

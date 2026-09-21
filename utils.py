@@ -149,6 +149,25 @@ def _expand_agmtlora_shared_state(model_state, target_state, config):
     return expanded_state
 
 
+def _rank_extract_checkpoint_mode(model_state, target_state):
+    """Classify extractor checkpoints as legacy initialization or full resume."""
+    marker = "lora_rank_extractors."
+    target_keys = {key for key in target_state if marker in key}
+    source_keys = {key for key in model_state if marker in key}
+    if not target_keys:
+        return "disabled", target_keys
+    if not source_keys:
+        return "initialization", target_keys
+    missing = sorted(target_keys - source_keys)
+    unexpected = sorted(source_keys - target_keys)
+    if missing or unexpected:
+        raise RuntimeError(
+            "Rank extractor checkpoint structure does not match the current model: "
+            f"missing={missing}, unexpected={unexpected}."
+        )
+    return "resume", target_keys
+
+
 def load_checkpoint(config, model, optimizer, lr_scheduler, loss_scaler, logger, backbone=False, quiet=False, extra_state=None, load_info=None):
     resume_path = config.MODEL.RESUME if not backbone else config.MODEL.RESUME_BACKBONE
     logger.info(
@@ -263,12 +282,50 @@ def load_checkpoint(config, model, optimizer, lr_scheduler, loss_scaler, logger,
         model.state_dict(),
         config,
     )
+    rank_extract_mode, target_rank_extract_keys = _rank_extract_checkpoint_mode(
+        model_state, model.state_dict()
+    )
     incompatible = model.load_state_dict(model_state, strict=False)
     if isinstance(incompatible, tuple):
         missing, unexpected = incompatible
     else:
         missing = getattr(incompatible, 'missing_keys', [])
         unexpected = getattr(incompatible, 'unexpected_keys', [])
+    missing_rank_extract = {key for key in missing if key in target_rank_extract_keys}
+    unexpected_rank_extract = {
+        key for key in unexpected if "lora_rank_extractors." in key
+    }
+    if rank_extract_mode == "initialization" and missing_rank_extract != target_rank_extract_keys:
+        raise RuntimeError(
+            "Legacy initialization must leave every rank extractor key missing; "
+            f"expected={sorted(target_rank_extract_keys)}, got={sorted(missing_rank_extract)}."
+        )
+    if rank_extract_mode == "resume" and missing_rank_extract:
+        raise RuntimeError(
+            f"Full rank extractor resume is missing keys: {sorted(missing_rank_extract)}."
+        )
+    if unexpected_rank_extract:
+        raise RuntimeError(
+            f"Unexpected rank extractor checkpoint keys: {sorted(unexpected_rank_extract)}."
+        )
+    if target_rank_extract_keys and not backbone:
+        ignored_missing_fragments = (
+            "attn_mask",
+            "relative_position_index",
+            "relative_coords_table",
+        )
+        disallowed_missing = [
+            key for key in missing
+            if key not in target_rank_extract_keys
+            and not any(fragment in key for fragment in ignored_missing_fragments)
+            and not (skip_decoder and key.startswith("decoders"))
+        ]
+        if disallowed_missing or unexpected:
+            raise RuntimeError(
+                "Rank extractor checkpoint loading only permits expected new gate keys "
+                "and regenerated Swin buffers to be absent; "
+                f"missing={sorted(disallowed_missing)}, unexpected={sorted(unexpected)}."
+            )
     if not quiet:
         if len(missing) > 0:
             logger.warning("=============Missing Keys==============")
@@ -282,7 +339,19 @@ def load_checkpoint(config, model, optimizer, lr_scheduler, loss_scaler, logger,
     if load_info is not None:
         load_info.clear()
         load_info['restored_train_state'] = False
-    if not config.EVAL_MODE and 'optimizer' in checkpoint and 'lr_scheduler' in checkpoint and 'epoch' in checkpoint and not skip_decoder:
+        load_info['rank_extract_checkpoint_mode'] = rank_extract_mode
+        load_info['missing_rank_extract_keys'] = sorted(missing_rank_extract)
+    restore_train_state = rank_extract_mode != "initialization"
+    if rank_extract_mode == "initialization":
+        if not quiet:
+            logger.info(
+                "Rank extractor parameters were identity-initialized from a legacy checkpoint; "
+                "optimizer, scheduler, scaler, and epoch state will not be restored."
+            )
+        config.defrost()
+        config.TRAIN.START_EPOCH = 0
+        config.freeze()
+    if not config.EVAL_MODE and 'optimizer' in checkpoint and 'lr_scheduler' in checkpoint and 'epoch' in checkpoint and not skip_decoder and restore_train_state:
         optimizer.load_state_dict(checkpoint["optimizer"])
         lr_scheduler.load_state_dict(checkpoint["lr_scheduler"])
         config.defrost()

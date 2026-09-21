@@ -1269,6 +1269,7 @@ class Stage1MetaSplitTest(unittest.TestCase):
             original_ranked_partitions = stage1.run_partition_search(tasks, final_predictions, max_groups=2)
             original_grouping_payload = {
                 "stage1_runtime_schema_version": stage1.STAGE1_RUNTIME_SCHEMA_VERSION,
+                "prompt_window_layout_version": stage1.PROMPT_WINDOW_LAYOUT_VERSION,
                 "tasks": tasks,
                 "groups": [["task_a"], ["task_b"]],
                 "task_to_group": {"task_a": "group_0", "task_b": "group_1"},

@@ -1,0 +1,11 @@
+BASE: ['unipora_cara_tiny_448_r64_prom50_global_group_proxy_2lr.yaml']
+
+MODEL:
+  NAME: unipora_cara_tiny_448_r64_prom50_corrected_e0
+  MTLORA:
+    RANK_EXTRACT:
+      ENABLED: False
+  AGMTLORA:
+    GROUPING_SOURCE: fixed_json
+    GROUPING_JSON: ''
+    GROUP_SHARED_RANKS: []

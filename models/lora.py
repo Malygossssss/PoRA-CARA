@@ -156,6 +156,54 @@ class LoRALinear(LoRALayer):
         return pretrained + lora
 
 
+class RankExtractionGate(nn.Module):
+    """Prompt-conditioned, per-token gate over a group LoRA rank space."""
+
+    def __init__(self, rank: int, hidden_dim: int = 16, eps: float = 1e-6):
+        super().__init__()
+        if int(rank) <= 0:
+            raise ValueError("RankExtractionGate rank must be positive.")
+        if int(hidden_dim) <= 0:
+            raise ValueError("RankExtractionGate hidden_dim must be positive.")
+        if float(eps) <= 0:
+            raise ValueError("RankExtractionGate eps must be positive.")
+        self.rank = int(rank)
+        self.hidden_dim = int(hidden_dim)
+        self.eps = float(eps)
+        self.z_proj = nn.Linear(self.rank, self.hidden_dim, bias=False)
+        self.condition_proj = nn.Linear(self.rank, self.hidden_dim, bias=False)
+        self.hidden_bias = nn.Parameter(torch.zeros(self.hidden_dim))
+        self.output = nn.Linear(self.hidden_dim, self.rank, bias=True)
+        self.reset_output_identity()
+
+    def reset_output_identity(self) -> None:
+        """Make 2 * sigmoid(logits) exactly one without erasing input projections."""
+        nn.init.zeros_(self.output.weight)
+        nn.init.zeros_(self.output.bias)
+        nn.init.zeros_(self.hidden_bias)
+
+    def _rms_normalize(self, value: torch.Tensor) -> torch.Tensor:
+        value_fp32 = value.float()
+        inv_rms = torch.rsqrt(value_fp32.square().mean(dim=-1, keepdim=True) + self.eps)
+        return (value_fp32 * inv_rms).to(dtype=value.dtype)
+
+    def forward(self, rank_activations: torch.Tensor, condition: torch.Tensor) -> torch.Tensor:
+        if rank_activations.ndim != 3:
+            raise ValueError("rank_activations must have shape [B, N, r].")
+        if condition.ndim != 2:
+            raise ValueError("condition must have shape [B, r].")
+        if rank_activations.shape[0] != condition.shape[0]:
+            raise ValueError("rank_activations and condition batch sizes must match.")
+        if rank_activations.shape[-1] != self.rank or condition.shape[-1] != self.rank:
+            raise ValueError(f"RankExtractionGate expected rank dimension {self.rank}.")
+        z_norm = self._rms_normalize(rank_activations)
+        condition_norm = self._rms_normalize(condition)
+        hidden = self.z_proj(z_norm)
+        hidden = hidden + self.condition_proj(condition_norm)[:, None, :]
+        hidden = F.gelu(hidden + self.hidden_bias)
+        return 2.0 * torch.sigmoid(self.output(hidden))
+
+
 class MTLoRALinear(LoRALayer):
     # LoRA implemented in a dense layer
     def __init__(
@@ -174,6 +222,9 @@ class MTLoRALinear(LoRALayer):
         trainable_scale_per_task=False,
         shared_mode: str = 'matrix',
         layer_idx: int = -1,
+        rank_extract_enabled: bool = False,
+        rank_extract_hidden_dim: int = 16,
+        rank_extract_eps: float = 1e-6,
         **kwargs,
     ):
         assert shared_mode in ['matrix', 'matrixv2',
@@ -285,6 +336,24 @@ class MTLoRALinear(LoRALayer):
         if self.has_shared_lora or self.has_task_lora:
             self.reset_parameters()
 
+        self.rank_extract_enabled = bool(rank_extract_enabled)
+        if self.rank_extract_enabled:
+            if not self.ag_enabled:
+                raise ValueError("Rank extraction requires AG-MTLoRA group-shared ranks.")
+            if self.shared_mode != 'matrix':
+                raise ValueError("Rank extraction requires shared_mode='matrix'.")
+            if self.has_task_lora:
+                raise ValueError("Rank extraction requires all task-specific LoRA ranks to be zero.")
+            self.lora_rank_extractors = nn.ModuleDict({
+                group: RankExtractionGate(
+                    self.group_shared_ranks[group],
+                    hidden_dim=rank_extract_hidden_dim,
+                    eps=rank_extract_eps,
+                )
+                for group in self.group_names
+                if self.group_shared_ranks[group] > 0
+            })
+
     def reset_parameters(self):
         """Reset all the weights, even including pretrained ones."""
         if hasattr(self, "lora_shared_A"):
@@ -333,15 +402,47 @@ class MTLoRALinear(LoRALayer):
             return self.lora_shared_scale[group_name]
         return self.lora_shared_scale
 
-    def _apply_group_shared_lora(self, group_name: str, task_input: torch.Tensor) -> torch.Tensor:
+    def _apply_group_shared_lora(
+        self,
+        group_name: str,
+        task_input: torch.Tensor,
+        condition_input: torch.Tensor = None,
+        prompt_token_count: int = 0,
+    ) -> torch.Tensor:
+        if self.rank_extract_enabled and group_name not in self.lora_rank_extractors:
+            raise ValueError(
+                f"Rank extraction requires a positive rank for routed group {group_name!r}."
+            )
         if not hasattr(self, "lora_shared_A_groups"):
             return 0.0
         if group_name not in self.lora_shared_A_groups:
             return 0.0
+        rank_activations = (
+            task_input @ self.lora_shared_A_groups[group_name].transpose(0, 1)
+        )
+        if self.rank_extract_enabled:
+            if condition_input is None:
+                raise ValueError("Rank extraction requires the pre-dropout task input.")
+            if task_input.ndim != 3 or condition_input.ndim != 3:
+                raise ValueError("Rank extraction inputs must have shape [B, tokens, channels].")
+            if task_input.shape != condition_input.shape:
+                raise ValueError("Dropped and pre-dropout task inputs must have matching shapes.")
+            prompt_token_count = int(prompt_token_count)
+            if prompt_token_count <= 0 or prompt_token_count >= task_input.shape[1]:
+                raise ValueError(
+                    "prompt_token_count must be positive and leave at least one patch token."
+                )
+            prompt_condition = condition_input[:, :prompt_token_count, :].mean(dim=1)
+            prompt_condition = (
+                prompt_condition
+                @ self.lora_shared_A_groups[group_name].transpose(0, 1)
+            )
+            prompt_rank = rank_activations[:, :prompt_token_count, :]
+            patch_rank = rank_activations[:, prompt_token_count:, :]
+            mask = self.lora_rank_extractors[group_name](patch_rank, prompt_condition)
+            rank_activations = torch.cat((prompt_rank, mask * patch_rank), dim=1)
         return (
-            task_input
-            @ self.lora_shared_A_groups[group_name].transpose(0, 1)
-            @ self.lora_shared_B_groups[group_name].transpose(0, 1)
+            rank_activations @ self.lora_shared_B_groups[group_name].transpose(0, 1)
         ) * self._get_group_scale(group_name)
 
     def forward(
@@ -349,14 +450,18 @@ class MTLoRALinear(LoRALayer):
         x: torch.Tensor,
         x_tasks: Dict[str, torch.Tensor] = None,
         active_task: str = None,
+        prompt_token_count: int = 0,
     ):
         # TODO: handle merging
         pretrained = self.linear(x)
         if not self.has_lora:
             return pretrained, None
 
+        shared_input_raw = x
         x = self.lora_dropout(x)
         if self.ag_enabled:
+            if self.rank_extract_enabled and active_task is None:
+                raise ValueError("Rank extraction requires active_task routing.")
             if active_task is not None:
                 if self.tasks is None or active_task not in self.tasks:
                     raise ValueError(
@@ -372,13 +477,17 @@ class MTLoRALinear(LoRALayer):
             lora_tasks = {}
             for task in routed_tasks:
                 task_input_raw = x if x_tasks is None else x_tasks[task]
+                condition_input = shared_input_raw if x_tasks is None else x_tasks[task]
                 task_input = self.lora_dropout(task_input_raw)
                 task_pretrained = pretrained if x_tasks is None else self.linear(task_input_raw)
                 task_output = task_pretrained
 
                 if self.has_shared_lora and self.shared_lora_enabled:
                     task_output = task_output + self._apply_group_shared_lora(
-                        self.task_to_group[task], task_input
+                        self.task_to_group[task],
+                        task_input,
+                        condition_input=condition_input,
+                        prompt_token_count=prompt_token_count,
                     )
 
                 if self.has_task_lora and task in self.lora_tasks_A:

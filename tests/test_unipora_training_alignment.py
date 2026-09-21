@@ -71,7 +71,9 @@ class UniPoRATrainingAlignmentTests(unittest.TestCase):
             encoding="utf-8"
         )
 
-        self.assertIn("STAGE1_RUNTIME_SCHEMA_VERSION = 2", config_utils_source)
+        self.assertIn("STAGE1_RUNTIME_SCHEMA_VERSION = 3", config_utils_source)
+        self.assertIn('PROMPT_WINDOW_LAYOUT_VERSION = "batch_major_v1"', config_utils_source)
+        self.assertIn('post_extra_state.get("prompt_window_layout_version")', source)
         self.assertIn("Refusing to resume legacy Stage-1 affinity artifacts", source)
         self.assertIn('post_extra_state.get("amp_smoke_test")', source)
         self.assertIn("resume_artifact_validation", source)

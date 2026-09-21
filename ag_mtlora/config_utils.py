@@ -5,7 +5,8 @@ import random
 from typing import Dict, Iterable, List, Sequence, Tuple
 
 DEFAULT_PARTITION_GRANULARITY = "global"
-STAGE1_RUNTIME_SCHEMA_VERSION = 2
+STAGE1_RUNTIME_SCHEMA_VERSION = 3
+PROMPT_WINDOW_LAYOUT_VERSION = "batch_major_v1"
 SUPPORTED_PARTITION_GRANULARITIES = {"global", "stage"}
 
 
@@ -100,6 +101,12 @@ def load_grouping_json(grouping_json_path: str, expected_tasks: Sequence[str]) -
                 f"contract (found schema={runtime_schema_version}, "
                 f"required={STAGE1_RUNTIME_SCHEMA_VERSION}). Rerun Stage-1 from the original "
                 "backbone checkpoint."
+            )
+        prompt_window_layout = payload.get("prompt_window_layout_version")
+        if prompt_window_layout != PROMPT_WINDOW_LAYOUT_VERSION:
+            raise ValueError(
+                "Refusing to use a Stage-1 grouping with an incompatible prompt window layout "
+                f"(found={prompt_window_layout!r}, required={PROMPT_WINDOW_LAYOUT_VERSION!r})."
             )
 
     partition_granularity = normalize_partition_granularity(

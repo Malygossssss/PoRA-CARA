@@ -38,7 +38,8 @@ class CompatLinear(nn.Linear):
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
 
-    def forward(self, input: Tensor, x_tasks: dict = None, active_task: str = None) -> Tensor:
+    def forward(self, input: Tensor, x_tasks: dict = None, active_task: str = None,
+                prompt_token_count: int = 0) -> Tensor:
         return super().forward(input), None
 
 def _get_shared_only_rank(mtlora, layer_idx):
@@ -78,6 +79,21 @@ def _get_task_to_group(mtlora, layer_idx=None):
 def _should_route_task_streams(mtlora):
     return bool(getattr(mtlora, "AGMTLORA_ENABLED", False))
 
+
+def _rank_extract_settings(mtlora, layer_idx, module_name, is_stage_last):
+    rank_extract = getattr(mtlora, "RANK_EXTRACT", None)
+    if rank_extract is None or not bool(getattr(rank_extract, "ENABLED", False)):
+        return False, 16
+    stages = {int(stage) for stage in getattr(rank_extract, "STAGES", [])}
+    modules = {str(name).lower() for name in getattr(rank_extract, "MODULES", [])}
+    blocks = str(getattr(rank_extract, "BLOCKS", "all")).lower()
+    enabled = (
+        int(layer_idx) in stages
+        and str(module_name).lower() in modules
+        and (blocks == "all" or (blocks == "stage_last" and bool(is_stage_last)))
+    )
+    return enabled, int(getattr(rank_extract, "HIDDEN_DIM", 16))
+
 class Mlp(nn.Module):
     def __init__(self, in_features, hidden_features=None, out_features=None, act_layer=nn.GELU, drop=0., lora=False, tasks=None, mtlora=None, layer_idx=0):
         super().__init__()
@@ -88,6 +104,9 @@ class Mlp(nn.Module):
 
         route_tasks = tasks if (lora or mtlora.INTERMEDIATE_SPECIALIZATION or _should_route_task_streams(mtlora)) else None
         has_per_task_lora = bool(route_tasks) and (lora or mtlora.INTERMEDIATE_SPECIALIZATION)
+        fc1_rank_extract, rank_extract_hidden_dim = _rank_extract_settings(
+            mtlora, layer_idx, "fc1", lora
+        )
         if mtlora.FC1_ENABLED:
             self.fc1 = linear_cls(
                 in_features,
@@ -102,6 +121,8 @@ class Mlp(nn.Module):
                 trainable_scale_per_task=mtlora.TRAINABLE_SCALE_PER_TASK,
                 shared_mode=mtlora.SHARED_MODE,
                 layer_idx=layer_idx,
+                rank_extract_enabled=fc1_rank_extract,
+                rank_extract_hidden_dim=rank_extract_hidden_dim,
             )
         else:
             self.fc1 = CompatLinear(in_features, hidden_features)
@@ -126,8 +147,13 @@ class Mlp(nn.Module):
         self.tasks = tasks
         self.drop = nn.Dropout(drop)
 
-    def forward(self, x, x_tasks=None, active_task=None):
-        x, fc1_lora_tasks = self.fc1(x, x_tasks, active_task=active_task)
+    def forward(self, x, x_tasks=None, active_task=None, prompt_token_count=0):
+        x, fc1_lora_tasks = self.fc1(
+            x,
+            x_tasks,
+            active_task=active_task,
+            prompt_token_count=prompt_token_count,
+        )
         x = self.act(x)
         x = self.drop(x)
         if fc1_lora_tasks is not None:
