@@ -204,6 +204,61 @@ class RankExtractionGate(nn.Module):
         return 2.0 * torch.sigmoid(self.output(hidden))
 
 
+class PromptRankResidual(nn.Module):
+    """Retrieve token-specific prompt information as an additive rank residual.
+
+    Inputs already share the routed group's A projection. Attention is over
+    prompt tokens, never over tasks. The group-shared writeback starts at zero,
+    preserving the original LoRA path exactly at initialization.
+    """
+
+    def __init__(self, rank: int, residual_scale: float = 0.1,
+                 temperature: float = 0.25, center_values: bool = True,
+                 eps: float = 1e-6):
+        super().__init__()
+        if int(rank) <= 0:
+            raise ValueError("PromptRankResidual rank must be positive.")
+        for name, value in (("residual_scale", residual_scale),
+                            ("temperature", temperature), ("eps", eps)):
+            if not math.isfinite(float(value)) or float(value) <= 0:
+                raise ValueError(f"PromptRankResidual {name} must be finite and positive.")
+        self.rank = int(rank)
+        self.residual_scale = float(residual_scale)
+        self.temperature = float(temperature)
+        self.center_values = bool(center_values)
+        self.eps = float(eps)
+        # A distinct key also prevents resuming an E4 gate as this module.
+        self.writeback = nn.Linear(self.rank, self.rank, bias=False)
+        self.reset_output_identity()
+
+    def reset_output_identity(self) -> None:
+        nn.init.zeros_(self.writeback.weight)
+
+    def forward(self, rank_activations: torch.Tensor,
+                prompt_ranks: torch.Tensor) -> torch.Tensor:
+        if rank_activations.ndim != 3 or prompt_ranks.ndim != 3:
+            raise ValueError("Rank and prompt inputs must have shape [B, tokens, r].")
+        if rank_activations.shape[0] != prompt_ranks.shape[0]:
+            raise ValueError("Rank and prompt batch sizes must match.")
+        if rank_activations.shape[-1] != self.rank or prompt_ranks.shape[-1] != self.rank:
+            raise ValueError(f"PromptRankResidual expected rank dimension {self.rank}.")
+        if prompt_ranks.shape[1] == 0:
+            raise ValueError("PromptRankResidual requires at least one prompt token.")
+        # Disabling autocast here keeps the dot product and softmax in fp32;
+        # casting tensors to float alone would not guarantee this under AMP.
+        with torch.autocast(device_type=rank_activations.device.type, enabled=False):
+            queries = F.normalize(rank_activations.float(), dim=-1, eps=self.eps)
+            values = prompt_ranks.float()
+            keys = F.normalize(values, dim=-1, eps=self.eps)
+            scores = (queries @ keys.transpose(-1, -2)) / self.temperature
+            attention = scores.softmax(dim=-1)
+            if self.center_values:
+                values = values - values.mean(dim=1, keepdim=True)
+            retrieved = attention @ values
+        correction = self.writeback(retrieved.to(dtype=rank_activations.dtype))
+        return rank_activations + self.residual_scale * correction.to(rank_activations.dtype)
+
+
 class MTLoRALinear(LoRALayer):
     # LoRA implemented in a dense layer
     def __init__(
@@ -225,6 +280,10 @@ class MTLoRALinear(LoRALayer):
         rank_extract_enabled: bool = False,
         rank_extract_hidden_dim: int = 16,
         rank_extract_eps: float = 1e-6,
+        rank_extract_mode: str = 'gate',
+        rank_extract_residual_scale: float = 0.1,
+        rank_extract_temperature: float = 0.25,
+        rank_extract_center_values: bool = True,
         **kwargs,
     ):
         assert shared_mode in ['matrix', 'matrixv2',
@@ -337,7 +396,10 @@ class MTLoRALinear(LoRALayer):
             self.reset_parameters()
 
         self.rank_extract_enabled = bool(rank_extract_enabled)
+        self.rank_extract_mode = str(rank_extract_mode)
         if self.rank_extract_enabled:
+            if self.rank_extract_mode not in {'gate', 'prompt_residual'}:
+                raise ValueError("rank_extract_mode must be 'gate' or 'prompt_residual'.")
             if not self.ag_enabled:
                 raise ValueError("Rank extraction requires AG-MTLoRA group-shared ranks.")
             if self.shared_mode != 'matrix':
@@ -345,11 +407,17 @@ class MTLoRALinear(LoRALayer):
             if self.has_task_lora:
                 raise ValueError("Rank extraction requires all task-specific LoRA ranks to be zero.")
             self.lora_rank_extractors = nn.ModuleDict({
-                group: RankExtractionGate(
+                group: (RankExtractionGate(
                     self.group_shared_ranks[group],
                     hidden_dim=rank_extract_hidden_dim,
                     eps=rank_extract_eps,
-                )
+                ) if self.rank_extract_mode == 'gate' else PromptRankResidual(
+                    self.group_shared_ranks[group],
+                    residual_scale=rank_extract_residual_scale,
+                    temperature=rank_extract_temperature,
+                    center_values=rank_extract_center_values,
+                    eps=rank_extract_eps,
+                ))
                 for group in self.group_names
                 if self.group_shared_ranks[group] > 0
             })
@@ -432,15 +500,22 @@ class MTLoRALinear(LoRALayer):
                 raise ValueError(
                     "prompt_token_count must be positive and leave at least one patch token."
                 )
-            prompt_condition = condition_input[:, :prompt_token_count, :].mean(dim=1)
-            prompt_condition = (
-                prompt_condition
-                @ self.lora_shared_A_groups[group_name].transpose(0, 1)
-            )
             prompt_rank = rank_activations[:, :prompt_token_count, :]
             patch_rank = rank_activations[:, prompt_token_count:, :]
-            mask = self.lora_rank_extractors[group_name](patch_rank, prompt_condition)
-            rank_activations = torch.cat((prompt_rank, mask * patch_rank), dim=1)
+            prompt_input = condition_input[:, :prompt_token_count, :]
+            if self.rank_extract_mode == 'gate':
+                prompt_condition = (
+                    prompt_input.mean(dim=1)
+                    @ self.lora_shared_A_groups[group_name].transpose(0, 1)
+                )
+                mask = self.lora_rank_extractors[group_name](patch_rank, prompt_condition)
+                patch_rank = mask * patch_rank
+            else:
+                prompt_condition = (
+                    prompt_input @ self.lora_shared_A_groups[group_name].transpose(0, 1)
+                )
+                patch_rank = self.lora_rank_extractors[group_name](patch_rank, prompt_condition)
+            rank_activations = torch.cat((prompt_rank, patch_rank), dim=1)
         return (
             rank_activations @ self.lora_shared_B_groups[group_name].transpose(0, 1)
         ) * self._get_group_scale(group_name)

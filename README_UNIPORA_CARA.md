@@ -296,6 +296,16 @@ E0 使用同一命令，只替换 `--cfg`。两者必须共享 grouping、rank b
 
 E4 的 gate 输出头以零初始化，因此初始 mask 精确为 1。加载旧 Stage-1 或 extractor-off 正式训练权重时，只允许新增的 `lora_rank_extractors.*` keys 缺失，并重新建立 optimizer、scheduler、scaler 与起始 epoch；只有同结构、同分组、同 rank 的 E4 checkpoint 才执行完整训练状态恢复。日志会单独报告 `Rank extractor params`。
 
+### 5.2 E4-last 与多 prompt 条件 rank 残差（E5，待训练验证）
+
+`unipora_cara_tiny_448_r64_prom50_rank_extract_e4_last.yaml` 仅将 E4 缩小到 stage 3、4 的最后一个 block，用来检验调制位置的影响。
+
+`unipora_cara_tiny_448_r64_prom50_prompt_rank_residual_e5.yaml` 使用 `RANK_EXTRACT.MODE=prompt_residual`：保留所有交互后的 prompt，经当前组的 A 投影后由 patch 在 rank 空间检索；减去 prompt 均值，通过零初始化的组共享 rank 矩阵，将检索信息作为增量加到原 LoRA 路径。默认同样只使用两个 stage-last fc1，`RESIDUAL_SCALE=0.1`、`TEMPERATURE=0.25`。
+
+沿用 5.1 的训练命令，替换 `--cfg` 即可。E0、E4-last 和 E5 必须使用同一 Stage-1 grouping/checkpoint。E5 应从该 Stage-1 checkpoint 初始化，不能将 E4 checkpoint 当作 E5 续训。现有 E0/E4 配置行为保持不变；E5 尚未证实性能提升。
+
+详细公式、诊断、开销、创新性边界及对照命令见 [设计与实验方案](docs/plans/2026-09-24-prompt-rank-residual-design.md)。
+
 ## 6. 评估
 
 训练完成后，使用同一个 resolved config 和正式训练 checkpoint 评估：

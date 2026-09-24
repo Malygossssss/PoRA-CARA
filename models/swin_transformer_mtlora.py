@@ -107,6 +107,7 @@ class Mlp(nn.Module):
         fc1_rank_extract, rank_extract_hidden_dim = _rank_extract_settings(
             mtlora, layer_idx, "fc1", lora
         )
+        rank_extract = getattr(mtlora, "RANK_EXTRACT", None)
         if mtlora.FC1_ENABLED:
             self.fc1 = linear_cls(
                 in_features,
@@ -123,6 +124,10 @@ class Mlp(nn.Module):
                 layer_idx=layer_idx,
                 rank_extract_enabled=fc1_rank_extract,
                 rank_extract_hidden_dim=rank_extract_hidden_dim,
+                rank_extract_mode=getattr(rank_extract, "MODE", "gate"),
+                rank_extract_residual_scale=getattr(rank_extract, "RESIDUAL_SCALE", 0.1),
+                rank_extract_temperature=getattr(rank_extract, "TEMPERATURE", 0.25),
+                rank_extract_center_values=getattr(rank_extract, "CENTER_VALUES", True),
             )
         else:
             self.fc1 = CompatLinear(in_features, hidden_features)

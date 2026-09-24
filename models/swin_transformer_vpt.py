@@ -14,7 +14,7 @@ from torch.nn import Dropout
 
 from timm.models.layers import to_2tuple
 
-from .lora import RankExtractionGate
+from .lora import PromptRankResidual, RankExtractionGate
 
 from .swin_transformer_mtlora import (
     PatchMerging,
@@ -166,7 +166,7 @@ class PromptedSwinTransformer(SwinTransformerMTLoRA):
         # The model-wide initializer may touch nested Linear modules. Re-assert
         # the gate's exact identity output only after construction is complete.
         for module in self.modules():
-            if isinstance(module, RankExtractionGate):
+            if isinstance(module, (RankExtractionGate, PromptRankResidual)):
                 module.reset_output_identity()
 
     def forward(self, x, task=None, return_stages=False, flatten_ft=False):

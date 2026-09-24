@@ -1,0 +1,11 @@
+BASE: ['unipora_cara_tiny_448_r64_prom50_rank_extract_e4.yaml']
+
+MODEL:
+  NAME: unipora_cara_tiny_448_r64_prom50_prompt_rank_residual_e5
+  MTLORA:
+    RANK_EXTRACT:
+      MODE: prompt_residual
+      BLOCKS: stage_last
+      RESIDUAL_SCALE: 0.1
+      TEMPERATURE: 0.25
+      CENTER_VALUES: True

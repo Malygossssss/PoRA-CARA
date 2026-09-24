@@ -15,6 +15,7 @@
 
 
 import os
+import math
 import yaml
 import re
 from yacs.config import CfgNode as CN
@@ -390,6 +391,10 @@ _C.MODEL.MTLORA.RANK_EXTRACT.STAGES = [2, 3]
 _C.MODEL.MTLORA.RANK_EXTRACT.MODULES = ['fc1']
 _C.MODEL.MTLORA.RANK_EXTRACT.BLOCKS = 'all'
 _C.MODEL.MTLORA.RANK_EXTRACT.HIDDEN_DIM = 16
+_C.MODEL.MTLORA.RANK_EXTRACT.MODE = 'gate'
+_C.MODEL.MTLORA.RANK_EXTRACT.RESIDUAL_SCALE = 0.1
+_C.MODEL.MTLORA.RANK_EXTRACT.TEMPERATURE = 0.25
+_C.MODEL.MTLORA.RANK_EXTRACT.CENTER_VALUES = True
 
 _C.MODEL.AGMTLORA = CN()
 _C.MODEL.AGMTLORA.ENABLED = False
@@ -488,6 +493,17 @@ def _validate_rank_extract_config(config):
     rank_extract.BLOCKS = blocks
     if int(rank_extract.HIDDEN_DIM) <= 0:
         raise ValueError("RANK_EXTRACT.HIDDEN_DIM must be positive.")
+    mode = str(rank_extract.MODE).lower()
+    if mode not in {'gate', 'prompt_residual'}:
+        raise ValueError("RANK_EXTRACT.MODE must be 'gate' or 'prompt_residual'.")
+    rank_extract.MODE = mode
+    if mode == 'prompt_residual':
+        for name in ('RESIDUAL_SCALE', 'TEMPERATURE'):
+            value = float(getattr(rank_extract, name))
+            if not math.isfinite(value) or value <= 0:
+                raise ValueError(f"RANK_EXTRACT.{name} must be finite and positive.")
+        if int(config.MODEL.PROMPT.NUM_TOKENS) < 2 and bool(rank_extract.CENTER_VALUES):
+            raise ValueError("Centered prompt residuals require at least two prompt tokens.")
 
     nonzero_task_ranks = {
         task: list(config.MODEL.MTLORA.R_PER_TASK[task])

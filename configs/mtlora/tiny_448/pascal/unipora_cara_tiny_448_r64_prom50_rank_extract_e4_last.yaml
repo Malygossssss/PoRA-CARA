@@ -1,0 +1,8 @@
+BASE: ['unipora_cara_tiny_448_r64_prom50_rank_extract_e4.yaml']
+
+MODEL:
+  NAME: unipora_cara_tiny_448_r64_prom50_rank_extract_e4_last
+  MTLORA:
+    RANK_EXTRACT:
+      MODE: gate
+      BLOCKS: stage_last
