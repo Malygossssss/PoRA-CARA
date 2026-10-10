@@ -48,7 +48,6 @@ from constrained_mtl import (
 from evaluation.evaluate_utils import PerformanceMeter, get_output
 from evaluation.eval_edge import eval_edge_predictions
 from ptflops import get_model_complexity_info
-from models.lora import mark_only_lora_as_trainable, mark_prompt_as_trainable
 
 try:
     import wandb
@@ -77,7 +76,7 @@ def parse_option():
                         help="checkpoint saving frequency")
     parser.add_argument('--eval-freq', type=int, default=5,
                         help="model evaluation frequency")
-    parser.add_argument('--epochs', type=int, default=300,
+    parser.add_argument('--epochs', type=int,
                         help="number of epochs to train")
     parser.add_argument('--data-path', type=str, help='path to dataset')
     parser.add_argument('--zip', action='store_true',
@@ -89,6 +88,7 @@ def parse_option():
     parser.add_argument('--pretrained',
                         help='pretrained weight from checkpoint, could be imagenet22k pretrained weight')
     parser.add_argument('--resume', help='resume from checkpoint')
+    parser.add_argument('--init-checkpoint', help='Common model weights for a new experiment; reset training state')
     parser.add_argument('--accumulation-steps', type=int,
                         help="gradient accumulation steps")
     parser.add_argument('--use-checkpoint', action='store_true',
@@ -127,7 +127,7 @@ def parse_option():
                         help='overwrite optimizer if provided, can be adamw/sgd/fused_adam/fused_lamb.')
 
     # MTL Config
-    parser.add_argument('--tasks', type=str, default='depth',
+    parser.add_argument('--tasks', type=str,
                         help='List of tasks to run in MTL setup.')
     parser.add_argument(
         '--nyud', type=str, help='specify the path to load NYUD, replaces --data-path')
@@ -184,6 +184,10 @@ def main(config):
 
     model_without_ddp = model
 
+    from stage_ablation import prepare_trainable_parameters, adapter_parameter_summary, stage_ablation_metadata
+    prepare_trainable_parameters(model, config)
+    logger.info("Stage adapter policy: %s", json.dumps(adapter_parameter_summary(model)))
+    logger.info("Stage ablation identity: %s", json.dumps(stage_ablation_metadata(config)))
     optimizer = build_optimizer(config, model)
 
     loss_scaler = NativeScalerWithGradNormCount()
@@ -243,6 +247,10 @@ def main(config):
     resume_extra_state = {}
     resume_load_info = {}
 
+    if config.MODEL.INIT_CHECKPOINT and not config.MODEL.RESUME:
+        load_checkpoint(config, model_without_ddp, optimizer, lr_scheduler, loss_scaler, logger,
+                        initialization_path=config.MODEL.INIT_CHECKPOINT)
+
     if config.TRAIN.AUTO_RESUME:
         resume_file = auto_resume_helper(config.OUTPUT)
         if resume_file:
@@ -274,7 +282,7 @@ def main(config):
                 resume_load_info.get("restored_train_state", False),
             )
 
-        if not config.SKIP_INITIAL_EVAL:
+        if config.EVAL_MODE or not config.SKIP_INITIAL_EVAL:
             validate(config, data_loader_val, model, 0)
         if config.EVAL_MODE:
             return
@@ -286,6 +294,9 @@ def main(config):
             validate(config, data_loader_val, model, 0)
             return
 
+    if config.MODEL.INIT_CHECKPOINT and not config.MODEL.RESUME and not config.SKIP_INITIAL_EVAL and not config.EVAL_MODE:
+        validate(config, data_loader_val, model, 0)
+
     if config.EVAL_MODE:
         validate(config, data_loader_val, model, 0)
         return
@@ -295,7 +306,7 @@ def main(config):
         load_checkpoint(config, teacher, optimizer, lr_scheduler,
                         loss_scaler, logger, quiet=True)
 
-    if config.MODEL.PRETRAINED and (not config.MODEL.RESUME):
+    if config.MODEL.PRETRAINED and not config.MODEL.RESUME and not config.MODEL.INIT_CHECKPOINT:
         load_pretrained(config, model_without_ddp, logger)
         if not config.SKIP_INITIAL_EVAL:
             acc1, _, _ = validate(config, data_loader_val, model, 0)
@@ -303,36 +314,21 @@ def main(config):
     if config.THROUGHPUT_MODE:
         throughput(data_loader_val, model, logger)
         return
-    if config.MODEL.MTLORA.ENABLED:
-        if config.MODEL.MTLORA.FREEZE_PRETRAINED:
-            print("\nMarking LoRA params only as trainable:")
-            mark_only_lora_as_trainable(model.backbone,
-                                        bias=config.MODEL.MTLORA.BIAS,
-                                        freeze_patch_embed=config.TRAIN.FREEZE_PATCH_EMBED,
-                                        freeze_norm=config.TRAIN.FREEZE_LAYER_NORM,
-                                        free_relative_bias=config.TRAIN.FREEZE_RELATIVE_POSITION_BIAS,
-                                        freeze_downsample_reduction=True if config.MODEL.MTLORA.DOWNSAMPLER_ENABLED else config.TRAIN.FREEZE_DOWNSAMPLE_REDUCTION)
-            if config.MODEL.PROMPT.ENABLED:
-                mark_prompt_as_trainable(model.backbone)
-        else:
-            print("Marking all layers as trainable")
-    if config.MODEL.FREEZE_BACKBONE:
-        assert (not config.MODEL.MTLORA.ENABLED)
-        print("Freezing backbone.........")
-        model.freeze_backbone()
     trainable_params = sum(p.numel()
                            for p in model.parameters() if p.requires_grad)
     lora_params = sum(p.numel() for name, p in model.named_parameters()
                       if p.requires_grad and 'lora' in name)
     total_model_params = sum(p.numel() for p in model.parameters())
-    total_model_params_without_lora = total_model_params - lora_params
+    stored_lora_params = sum(p.numel() for name, p in model.named_parameters() if 'lora_' in name)
+    total_model_params_without_lora = total_model_params - stored_lora_params
     decoder_params = sum(p.numel() for name, p in model.named_parameters()
                          if 'backbone' not in name)
 
     logger.info(
         f"\nNumber of trainable params: {trainable_params:,}\n"
         f"Decoder params:             {decoder_params:,}\n"
-        f"LoRA params:                {lora_params:,}\n"
+        f"Trainable LoRA params:      {lora_params:,}\n"
+        f"Stored LoRA params:         {stored_lora_params:,}\n"
         f"Extra params:                {(trainable_params - (lora_params + decoder_params)):,}\n"
         f"Total params:               {total_model_params:,} (trainable ratio: {trainable_params/total_model_params * 100:2.2f}%)\n"
         f"Total params without LoRA:  {total_model_params_without_lora:,} (trainable ratio: {trainable_params/total_model_params_without_lora * 100:2.2f}%)"
@@ -996,6 +992,9 @@ if __name__ == '__main__':
     else:
         rank = -1
         world_size = -1
+    expected_world_size = config.MODEL.STAGE_ABLATION.WORLD_SIZE
+    if config.MODEL.STAGE_ABLATION.ENABLED and expected_world_size and world_size != expected_world_size:
+        raise ValueError(f"Stage ablation requires WORLD_SIZE={expected_world_size}, got {world_size}.")
     torch.cuda.set_device(config.LOCAL_RANK)
     torch.distributed.init_process_group(
         backend='nccl', init_method='env://', world_size=world_size, rank=rank)

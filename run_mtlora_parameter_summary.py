@@ -25,7 +25,7 @@ def parse_option():
     parser.add_argument("--deterministic", action="store_true", help="enable deterministic mode")
     parser.add_argument("--name", type=str, help="override model name")
     parser.add_argument("--tag", help="experiment tag")
-    parser.add_argument("--tasks", type=str, default="depth", help="comma separated tasks")
+    parser.add_argument("--tasks", type=str, help="comma separated tasks")
     parser.add_argument("--nyud", type=str, help="NYUD dataset path")
     parser.add_argument("--pascal", type=str, help="PASCAL dataset path")
     parser.add_argument("--local_rank", type=int, default=0, help="local rank")
@@ -147,6 +147,9 @@ def build_summary_payload(args, config, model, include_parameter_details=False):
     }
     payload.update(summarize_named_parameters(model, include_parameter_details=include_parameter_details))
     payload.update(summarize_named_buffers(model))
+    from stage_ablation import adapter_parameter_summary, stage_ablation_metadata
+    payload['adapter_summary'] = adapter_parameter_summary(model)
+    payload['stage_ablation'] = stage_ablation_metadata(config)
     return payload
 
 

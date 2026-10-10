@@ -1,0 +1,10 @@
+BASE:
+- resolved_baseline.yaml
+MODEL:
+  NAME: swin_t_stage_ablation_S3-G
+  STAGE_ABLATION:
+    MODES:
+    - B
+    - B
+    - G
+    - B

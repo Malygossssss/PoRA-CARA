@@ -1,0 +1,51 @@
+# Portable formal resolved config from run_20260907_031808; see README_STAGE_ABLATION.md.
+BASE:
+- ../../mtlora/tiny_448/pascal/unipora_cara_tiny_448_r64_prom50_global_group_proxy_2lr.yaml
+MODEL:
+  AGMTLORA:
+    ENABLED: true
+    GROUPING_JSON: grouping.json
+    GROUPING_SOURCE: fixed_json
+    GROUP_SHARED_RANKS:
+    - - 16
+      - 16
+      - 16
+      - 16
+    - - 48
+      - 48
+      - 48
+      - 48
+    PARTITION_GRANULARITY: global
+    STAGE: 1
+  INIT_CHECKPOINT: output/unipora_cara_tiny_448_r64_prom50_global_group_proxy_2lr/default/ag_mtlora_stage1_prepare/run_20260907_031808/post_affinity_checkpoint.pth
+  RESUME: ''
+  STAGE_ABLATION:
+    ENABLED: true
+    MODES:
+    - B
+    - B
+    - B
+    - B
+    WORLD_SIZE: 1
+  INIT_CHECKPOINT_SHA256: b05959165782d239377e0ab144ff52f6426c3f0327c4851235ba75ff67e20281
+DATA:
+  BATCH_SIZE: 10
+  DATA_PATH: PASCAL_MT
+  PASCAL: PASCAL_MT
+  DBNAME: PASCALContext
+TASKS:
+- semseg
+- normals
+- sal
+- human_parts
+SEED: 0
+EVAL_FREQ: 5
+SAVE_FREQ: 5
+TRAIN:
+  EPOCHS: 300
+  AUTO_RESUME: false
+  START_EPOCH: 0
+  FREEZE_PATCH_EMBED: false
+  FREEZE_LAYER_NORM: false
+  FREEZE_DOWNSAMPLE_REDUCTION: false
+  FREEZE_RELATIVE_POSITION_BIAS: false

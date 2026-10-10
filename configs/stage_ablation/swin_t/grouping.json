@@ -1,0 +1,56 @@
+{
+  "stage1_runtime_schema_version": 2,
+  "tasks": [
+    "semseg",
+    "normals",
+    "sal",
+    "human_parts"
+  ],
+  "partition_granularity": "global",
+  "groups": [
+    [
+      "semseg",
+      "human_parts"
+    ],
+    [
+      "normals",
+      "sal"
+    ]
+  ],
+  "task_to_group": {
+    "semseg": "group_0",
+    "human_parts": "group_0",
+    "normals": "group_1",
+    "sal": "group_1"
+  },
+  "max_groups": 2,
+  "partition_score": 0.21291024717356777,
+  "group_shared_ranks": [
+    [
+      32,
+      32,
+      32,
+      32
+    ],
+    [
+      32,
+      32,
+      32,
+      32
+    ]
+  ],
+  "search_objective": "mean_group_proxy",
+  "search_score_source": "group_proxy",
+  "search_score_path": "/public/home/wangbangjun/users/wyf/Project/pora_cara/output/unipora_cara_tiny_448_r64_prom50_global_group_proxy_2lr/default/ag_mtlora_stage1_prepare/run_20260907_031808/group_proxy.json",
+  "selection_data_split_mode": "train_meta_strict",
+  "selection_eval_label": "meta-val",
+  "meta_split_path": "/public/home/wangbangjun/users/wyf/Project/pora_cara/output/unipora_cara_tiny_448_r64_prom50_global_group_proxy_2lr/default/ag_mtlora_stage1_prepare/run_20260907_031808/meta_split.json",
+  "affinity_path": "/public/home/wangbangjun/users/wyf/Project/pora_cara/output/unipora_cara_tiny_448_r64_prom50_global_group_proxy_2lr/default/ag_mtlora_stage1_prepare/run_20260907_031808/affinity.json",
+  "final_predictions_path": null,
+  "warmup_checkpoint": "/public/home/wangbangjun/users/wyf/Project/pora_cara/output/unipora_cara_tiny_448_r64_prom50_global_group_proxy_2lr/default/ag_mtlora_stage1_prepare/run_20260907_031808/warmup_checkpoint.pth",
+  "post_affinity_checkpoint": "/public/home/wangbangjun/users/wyf/Project/pora_cara/output/unipora_cara_tiny_448_r64_prom50_global_group_proxy_2lr/default/ag_mtlora_stage1_prepare/run_20260907_031808/post_affinity_checkpoint.pth",
+  "affinity_warmup_epochs": 5,
+  "affinity_score_epochs": 50,
+  "partition_search_results": "/public/home/wangbangjun/users/wyf/Project/pora_cara/output/unipora_cara_tiny_448_r64_prom50_global_group_proxy_2lr/default/ag_mtlora_stage1_prepare/run_20260907_031808/partition_search_results__group_proxy.json",
+  "group_rank_source": "auto_equal_split"
+}

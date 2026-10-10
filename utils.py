@@ -149,15 +149,24 @@ def _expand_agmtlora_shared_state(model_state, target_state, config):
     return expanded_state
 
 
-def load_checkpoint(config, model, optimizer, lr_scheduler, loss_scaler, logger, backbone=False, quiet=False, extra_state=None, load_info=None):
-    resume_path = config.MODEL.RESUME if not backbone else config.MODEL.RESUME_BACKBONE
+def load_checkpoint(config, model, optimizer, lr_scheduler, loss_scaler, logger, backbone=False, quiet=False, extra_state=None, load_info=None, initialization_path=None):
+    resume_path = initialization_path or (config.MODEL.RESUME if not backbone else config.MODEL.RESUME_BACKBONE)
     logger.info(
         f"==============> Resuming form {resume_path}....................")
+    if initialization_path is not None:
+        from stage_ablation import verify_initialization_file
+        verify_initialization_file(config, initialization_path)
+        logger.info("Loading common model weights only; optimizer, scheduler and epoch remain fresh.")
     if resume_path.startswith('https'):
         checkpoint = torch.hub.load_state_dict_from_url(
             resume_path, map_location='cpu', check_hash=True)
     else:
         checkpoint = torch.load(resume_path, map_location='cpu')
+
+    from stage_ablation import validate_ablation_checkpoint
+    if initialization_path is None:
+        validate_ablation_checkpoint(config, checkpoint, model,
+                                    optimizer if not config.EVAL_MODE else None)
 
     mtlora = config.MODEL.MTLORA
     mtlora_enabled = mtlora.ENABLED
@@ -269,6 +278,11 @@ def load_checkpoint(config, model, optimizer, lr_scheduler, loss_scaler, logger,
     else:
         missing = getattr(incompatible, 'missing_keys', [])
         unexpected = getattr(incompatible, 'unexpected_keys', [])
+    if getattr(config.MODEL, 'STAGE_ABLATION', None) is not None and config.MODEL.STAGE_ABLATION.ENABLED:
+        meaningful_missing = [key for key in missing if 'attn_mask' not in key]
+        if meaningful_missing or unexpected:
+            purpose = "Common initialization" if initialization_path is not None else "Same-experiment checkpoint"
+            raise ValueError(f"{purpose} model keys mismatch: missing={meaningful_missing}, unexpected={unexpected}")
     if not quiet:
         if len(missing) > 0:
             logger.warning("=============Missing Keys==============")
@@ -282,8 +296,12 @@ def load_checkpoint(config, model, optimizer, lr_scheduler, loss_scaler, logger,
     if load_info is not None:
         load_info.clear()
         load_info['restored_train_state'] = False
-    if not config.EVAL_MODE and 'optimizer' in checkpoint and 'lr_scheduler' in checkpoint and 'epoch' in checkpoint and not skip_decoder:
-        optimizer.load_state_dict(checkpoint["optimizer"])
+    if initialization_path is None and not config.EVAL_MODE and 'optimizer' in checkpoint and 'lr_scheduler' in checkpoint and 'epoch' in checkpoint and not skip_decoder:
+        try:
+            optimizer.load_state_dict(checkpoint["optimizer"])
+        except (ValueError, KeyError) as error:
+            raise ValueError("Checkpoint optimizer parameter groups are incompatible; use "
+                             "MODEL.INIT_CHECKPOINT for a new experiment.") from error
         lr_scheduler.load_state_dict(checkpoint["lr_scheduler"])
         config.defrost()
         config.TRAIN.START_EPOCH = checkpoint['epoch'] + 1
@@ -296,7 +314,7 @@ def load_checkpoint(config, model, optimizer, lr_scheduler, loss_scaler, logger,
             max_accuracy = checkpoint['max_accuracy']
         if load_info is not None:
             load_info['restored_train_state'] = True
-    if extra_state is not None:
+    if extra_state is not None and initialization_path is None:
         extra_state.clear()
         if 'extra_state' in checkpoint and isinstance(checkpoint['extra_state'], dict):
             extra_state.update(checkpoint['extra_state'])
@@ -408,6 +426,7 @@ def load_pretrained(config, model, logger):
 
 
 def save_checkpoint(config, epoch, model, max_accuracy, optimizer, lr_scheduler, loss_scaler, logger, extra_state=None):
+    from stage_ablation import stage_ablation_metadata, optimizer_parameter_names
     save_state = {'model': model.state_dict(),
                   'optimizer': optimizer.state_dict(),
                   'lr_scheduler': lr_scheduler.state_dict(),
@@ -415,6 +434,10 @@ def save_checkpoint(config, epoch, model, max_accuracy, optimizer, lr_scheduler,
                   'scaler': loss_scaler.state_dict(),
                   'epoch': epoch,
                   'config': config}
+    metadata = stage_ablation_metadata(config)
+    if metadata is not None:
+        save_state['stage_ablation'] = metadata
+        save_state['optimizer_parameter_names'] = optimizer_parameter_names(model, optimizer)
     if extra_state is not None:
         save_state['extra_state'] = extra_state
 

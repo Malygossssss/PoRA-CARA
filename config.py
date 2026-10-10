@@ -34,6 +34,8 @@ _C = CN()
 
 # Base config files
 _C.BASE = ['']
+_C.TASKS = ['depth']
+_C.MTL = False
 
 # -----------------------------------------------------------------------------
 # Data settings
@@ -43,6 +45,9 @@ _C.DATA = CN()
 _C.DATA.BATCH_SIZE = 128
 # Path to dataset, could be overwritten by command line argument
 _C.DATA.DATA_PATH = ''
+_C.DATA.DBNAME = 'NYUD'
+_C.DATA.PASCAL = ''
+_C.DATA.NYUD = ''
 # Dataset name
 _C.DATA.DATASET = 'nyud'
 # Input image size
@@ -192,6 +197,14 @@ _C.MODEL.PROMPT.DROPOUT = 0.0
 _C.MODEL.PROMPT.INITIATION = 'random'
 _C.MODEL.PROMPT.DYNAMIC_PROMPT = False
 _C.MODEL.PROMPT.SHARE_TASK_PROMPT = False
+
+_C.MODEL.STAGE_ABLATION = CN()
+_C.MODEL.STAGE_ABLATION.ENABLED = False
+_C.MODEL.STAGE_ABLATION.MODES = ['B', 'B', 'B', 'B']
+_C.MODEL.STAGE_ABLATION.WORLD_SIZE = 0
+# Weight-only common initialization, never restores training state.
+_C.MODEL.INIT_CHECKPOINT = ''
+_C.MODEL.INIT_CHECKPOINT_SHA256 = ''
 
 # -----------------------------------------------------------------------------
 # Training settings
@@ -442,6 +455,12 @@ def _update_config_from_file(config, cfg_file):
             _update_config_from_file(
                 config, os.path.join(os.path.dirname(cfg_file), cfg)
             )
+    ag = yaml_cfg.get('MODEL', {}).get('AGMTLORA', {})
+    grouping_path = ag.get('GROUPING_JSON', '')
+    if grouping_path and not os.path.isabs(grouping_path):
+        adjacent = os.path.join(os.path.dirname(os.path.abspath(cfg_file)), grouping_path)
+        if os.path.isfile(adjacent):
+            ag['GROUPING_JSON'] = adjacent
     print('=> merge config from {}'.format(cfg_file))
     config.merge_from_other_cfg(CN(yaml_cfg))
     config.freeze()
@@ -466,8 +485,6 @@ def update_config(config, args):
         config.SAVE_FREQ = args.ckpt_freq
     if _check_args('eval_freq'):
         config.EVAL_FREQ = args.eval_freq
-    else:
-        config.EVAL_FREQ = 1
 
     if _check_args('skip_initial_validation'):
         config.SKIP_INITIAL_EVAL = True
@@ -490,7 +507,7 @@ def update_config(config, args):
         config.TRAIN.SKIP_DECODER_CKPT = args.skip_decoder
     if _check_args('data_path'):
         config.DATA.DATA_PATH = args.data_path
-    db_name = "NYUD"
+    db_name = config.DATA.DBNAME
     if _check_args('nyud'):
         config.DATA.NYUD = args.nyud
         config.DATA.DATA_PATH = args.nyud
@@ -501,8 +518,9 @@ def update_config(config, args):
         db_name = "PASCALContext"
     config.DATA.DBNAME = db_name
 
-    if _check_args('tasks'):
-        config.TASKS = re.compile(r'\s*,\s*').split(args.tasks)
+    if _check_args('tasks') or config.TASKS:
+        if _check_args('tasks'):
+            config.TASKS = re.compile(r'\s*,\s*').split(args.tasks)
         assert 'shared' not in config.TASKS, 'shared is a reserved task name'
         config.MTL = True
         tsk_config, _ = get_tasks_config(
@@ -524,6 +542,8 @@ def update_config(config, args):
         config.MODEL.PRETRAINED = args.pretrained
     if _check_args('resume'):
         config.MODEL.RESUME = args.resume
+    if _check_args('init_checkpoint'):
+        config.MODEL.INIT_CHECKPOINT = args.init_checkpoint
     if _check_args('resume_backbone'):
         config.MODEL.RESUME_BACKBONE = args.resume_backbone
     else:
@@ -868,5 +888,8 @@ def get_config(args):
     # This is for the "local variable" use pattern
     config = _C.clone()
     update_config(config, args)
+
+    from stage_ablation import resolve_stage_modes
+    resolve_stage_modes(config)
 
     return config

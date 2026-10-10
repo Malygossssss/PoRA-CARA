@@ -154,6 +154,8 @@ class PromptedSwinTransformer(SwinTransformerMTLoRA):
         if task not in self.prompt_embeddings:
             raise KeyError(f"Unknown prompt task: {task}")
         x = self.get_patch_embeddings(x)
+        if not getattr(self, "stage_prompt_enabled", (True,) * self.num_layers)[0]:
+            return x
         prompt_embd = self.prompt_dropout(
             self.prompt_embeddings[task].expand(x.shape[0], -1, -1)
         )
@@ -163,9 +165,9 @@ class PromptedSwinTransformer(SwinTransformerMTLoRA):
         x = self.incorporate_prompt(x, task)
         feats = []
         for layer_idx, layer in enumerate(self.layers):
-            deep_prompt_embd = self.prompt_dropout(
-                self.deep_prompt_embeddings[layer_idx][task]
-            )
+            enabled = getattr(self, "stage_prompt_enabled", (True,) * self.num_layers)[layer_idx]
+            deep_prompt_embd = (self.prompt_dropout(self.deep_prompt_embeddings[layer_idx][task])
+                                if enabled else None)
             x = layer(x, task, deep_prompt_embd)
             if return_stages:
                 prompt_count = x.shape[1] - (
@@ -258,6 +260,16 @@ class PromptedBasicLayer(nn.Module):
     def forward(self, x, task, deep_prompt_embd):
         B = x.shape[0]
         num_blocks = len(self.blocks)
+        if deep_prompt_embd is None:
+            prompt_count = x.shape[1] - self.input_resolution[0] * self.input_resolution[1]
+            x = x[:, prompt_count:, :]
+            for block in self.blocks:
+                x, tasks_lora = block(x, active_task=task)
+                if tasks_lora is not None:
+                    x = tasks_lora[task]
+            if self.downsample is not None:
+                x = self.downsample(x)
+            return x
         if deep_prompt_embd.shape[0] not in {max(num_blocks - 1, 0), num_blocks}:
             raise ValueError(
                 "Deep prompt block count must equal depth or depth - 1 for the first stage."
@@ -396,7 +408,7 @@ class PromptedSwinTransformerBlock(SwinTransformerBlock):
 
         num_windows = int(x_windows.shape[0] / B)
         prompt_windows = prompt_emb.unsqueeze(0).expand(num_windows, -1, -1, -1)
-        prompt_windows = prompt_windows.reshape((-1, prompt_count, C))
+        prompt_windows = prompt_windows.reshape((num_windows * B, prompt_count, C))
         x_windows = torch.cat((prompt_windows, x_windows), dim=1)
 
         attn_windows, attn_windows_lora_tasks = self.attn(
@@ -407,13 +419,13 @@ class PromptedSwinTransformerBlock(SwinTransformerBlock):
 
         prompt_emb = attn_windows[:, :prompt_count, :]
         attn_windows = attn_windows[:, prompt_count:, :]
-        prompt_emb = prompt_emb.view(-1, B, prompt_count, C).mean(0)
+        prompt_emb = prompt_emb.reshape(num_windows, B, prompt_count, C).mean(0)
 
         prompt_emb_lora_tasks = {}
         if attn_windows_lora_tasks is not None:
             for task in attn_windows_lora_tasks.keys():
                 prompt_task = attn_windows_lora_tasks[task][:, :prompt_count, :]
-                prompt_emb_lora_tasks[task] = prompt_task.view(-1, B, prompt_count, C).mean(0)
+                prompt_emb_lora_tasks[task] = prompt_task.reshape(num_windows, B, prompt_count, C).mean(0)
                 attn_windows_lora_tasks[task] = attn_windows_lora_tasks[task][:, prompt_count:, :]
 
         attn_windows = attn_windows.view(-1, self.window_size, self.window_size, C)

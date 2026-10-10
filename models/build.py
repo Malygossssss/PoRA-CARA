@@ -101,6 +101,8 @@ def build_model(config, is_pretrain=False):
     else:
         raise NotImplementedError(f"Unkown model: {model_type}")
 
+    from stage_ablation import configure_stage_ablation
+    configure_stage_ablation(model, config)
     return model
 
 

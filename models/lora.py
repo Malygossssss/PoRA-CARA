@@ -443,7 +443,7 @@ class MTLoRAQKV(LoRALayer):
     ):
         if isinstance(r, int):
             r = {'shared': r}
-        super().__init__(r=r, lora_alpha=lora_shared_scale, lora_dropout=lora_dropout)
+        super().__init__(r=max(r.values(), default=0), lora_alpha=lora_shared_scale, lora_dropout=lora_dropout)
         self.tasks = tasks
         self.layer_idx = layer_idx
         self.q = MTLoRALinear(in_features, out_features, r=r, lora_shared_scale=lora_shared_scale, lora_task_scale=lora_task_scale, lora_dropout=lora_dropout,
@@ -812,6 +812,8 @@ def mark_prompt_as_trainable(model: nn.Module) -> None:
     for name, param in model.named_parameters():
         if "prompt_embeddings" in name or "deep_prompt_embeddings" in name:
             param.requires_grad = True
+    from stage_ablation import freeze_stage_ablation
+    freeze_stage_ablation(model)
 
 
 def lora_filter(key: str, value: Any) -> bool:

@@ -99,7 +99,10 @@ class UniPoRATrainingAlignmentTests(unittest.TestCase):
         self.assertNotIn("DistributedDataParallel", call_names)
         self.assertNotIn("no_sync", attribute_names)
         self.assertIn("ConstrainedMTLController", call_names)
-        self.assertIn("mark_prompt_as_trainable", call_names)
+        self.assertIn("prepare_trainable_parameters", call_names)
+        policy_tree = _parse("stage_ablation.py")
+        policy_calls = {_call_name(node) for node in ast.walk(policy_tree) if isinstance(node, ast.Call)}
+        self.assertIn("mark_prompt_as_trainable", policy_calls)
 
     def test_mtl_build_does_not_partition_train_or_validation_data(self):
         tree = _parse("data/build.py")
