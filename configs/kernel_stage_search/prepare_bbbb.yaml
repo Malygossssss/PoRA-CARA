@@ -1,0 +1,8 @@
+BASE:
+  - swin_t_pascal.yaml
+MODEL:
+  NAME: swin_t_kernel_stage_prepare_bbbb
+  KERNEL_SEARCH:
+    PHASE: prepare
+  STAGE_ABLATION:
+    MODES: [B, B, B, B]

@@ -1,0 +1,12 @@
+BASE:
+  - ../stage_ablation/swin_t/resolved_baseline.yaml
+MODEL:
+  NAME: swin_t_kernel_stage_search
+  KERNEL_SEARCH:
+    ENABLED: true
+    PHASE: score
+    SOURCE_META_SPLIT: output/unipora_cara_tiny_448_r64_prom50_global_group_proxy_2lr/default/ag_mtlora_stage1_prepare/run_20260907_031808/meta_split.json
+TRAIN:
+  EPOCHS: 300
+  AUTO_RESUME: false
+  USE_CHECKPOINT: false

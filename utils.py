@@ -163,6 +163,9 @@ def load_checkpoint(config, model, optimizer, lr_scheduler, loss_scaler, logger,
     else:
         checkpoint = torch.load(resume_path, map_location='cpu')
 
+    from kernel_stage_search.protocol import validate_preparation_checkpoint
+    validate_preparation_checkpoint(config, checkpoint, initialization=initialization_path is not None)
+
     from stage_ablation import validate_ablation_checkpoint
     if initialization_path is None:
         validate_ablation_checkpoint(config, checkpoint, model,
@@ -441,10 +444,18 @@ def save_checkpoint(config, epoch, model, max_accuracy, optimizer, lr_scheduler,
     if extra_state is not None:
         save_state['extra_state'] = extra_state
 
+    from kernel_stage_search.protocol import preparation_metadata
+    preparation = preparation_metadata(config, epoch)
+    if preparation is not None:
+        save_state['kernel_search_preparation'] = preparation
+
     save_name = f'ckpt_epoch_{epoch}.pth'
     save_path = os.path.join(config.OUTPUT, save_name)
     logger.info(f"{save_path} saving......")
     torch.save(save_state, save_path)
+    if preparation is not None and preparation['prepared_complete']:
+        from kernel_stage_search.checkpoint import register_prepared_checkpoint
+        register_prepared_checkpoint(config, save_path, checkpoint=save_state)
     logger.info(f"{save_path} saved !!!")
     return save_path
 

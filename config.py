@@ -36,6 +36,9 @@ _C = CN()
 _C.BASE = ['']
 _C.TASKS = ['depth']
 _C.MTL = False
+# Resolved snapshots include these derived fields; update_config recomputes them.
+_C.EVAL_TRAINING = None
+_C.TASKS_CONFIG = CN(new_allowed=True)
 
 # -----------------------------------------------------------------------------
 # Data settings
@@ -202,6 +205,38 @@ _C.MODEL.STAGE_ABLATION = CN()
 _C.MODEL.STAGE_ABLATION.ENABLED = False
 _C.MODEL.STAGE_ABLATION.MODES = ['B', 'B', 'B', 'B']
 _C.MODEL.STAGE_ABLATION.WORLD_SIZE = 0
+
+# Runtime-derived fields are declared so a resolved snapshot is reloadable.
+_C.MODEL.RESUME_BACKBONE = False
+_C.MODEL.FREEZE_BACKBONE = False
+_C.MODEL.SAVE_SAMPLE = False
+
+# Frozen task-kernel stage search. All paths here are project-root-relative.
+_C.MODEL.KERNEL_SEARCH = CN()
+_C.MODEL.KERNEL_SEARCH.ENABLED = False
+_C.MODEL.KERNEL_SEARCH.PHASE = 'off'
+_C.MODEL.KERNEL_SEARCH.SOURCE_META_SPLIT = ''
+_C.MODEL.KERNEL_SEARCH.SCORE_CHECKPOINT = ''
+_C.MODEL.KERNEL_SEARCH.PROTOCOL = ''
+_C.MODEL.KERNEL_SEARCH.RUNTIME_PROTOCOL_ID = ''
+_C.MODEL.KERNEL_SEARCH.RUNTIME_SPLIT_ID = ''
+_C.MODEL.KERNEL_SEARCH.PREPARE_EPOCHS = 60
+_C.MODEL.KERNEL_SEARCH.CALIBRATION_IMAGES = 256
+_C.MODEL.KERNEL_SEARCH.INFO_BATCHES = 16
+_C.MODEL.KERNEL_SEARCH.INFO_BATCH_IMAGES = 8
+_C.MODEL.KERNEL_SEARCH.MAX_BATCH_IMAGES = 32
+_C.MODEL.KERNEL_SEARCH.SAMPLES_PER_TASK = 512
+_C.MODEL.KERNEL_SEARCH.FORWARD_BATCH_SIZE = 4
+_C.MODEL.KERNEL_SEARCH.BANDWIDTH_SAMPLES = 1024
+_C.MODEL.KERNEL_SEARCH.SAMPLE_SEED = 0
+_C.MODEL.KERNEL_SEARCH.SHUFFLE_SEED = 1
+_C.MODEL.KERNEL_SEARCH.LABEL_MODE = 'true_labels'
+_C.MODEL.KERNEL_SEARCH.SEARCH_BUDGET = 12
+_C.MODEL.KERNEL_SEARCH.INITIAL_MODES = ['BBBB', 'PPPP', 'GGGG']
+_C.MODEL.KERNEL_SEARCH.GP_NOISE_VARIANCE = 1e-6
+_C.MODEL.KERNEL_SEARCH.UCB_BETA = 2.0
+_C.MODEL.KERNEL_SEARCH.STD_FLOOR = 1e-6
+_C.MODEL.KERNEL_SEARCH.ENTROPY_MIN = 1e-8
 # Weight-only common initialization, never restores training state.
 _C.MODEL.INIT_CHECKPOINT = ''
 _C.MODEL.INIT_CHECKPOINT_SHA256 = ''
@@ -370,6 +405,8 @@ _C.MODEL.PER_TASK_DOWNSAMPLER = True
 _C.MODEL.UPDATE_RELATIVE_POSITION = False
 
 _C.MODEL.MTLORA = CN()
+_C.MODEL.MTLORA.R_PER_TASK_LIST = []
+_C.MODEL.MTLORA.SCALE_PER_TASK_LIST = []
 _C.MODEL.MTLORA.ENABLED = False
 _C.MODEL.MTLORA.BIAS = 'none'  # none, all, lora_only
 _C.MODEL.MTLORA.R = [8, 8, 8, 8]
@@ -891,5 +928,16 @@ def get_config(args):
 
     from stage_ablation import resolve_stage_modes
     resolve_stage_modes(config)
+
+    from kernel_stage_search.protocol import validate_config, resolve_path
+    if config.MODEL.KERNEL_SEARCH.ENABLED:
+        config.defrost()
+        for key in ('SOURCE_META_SPLIT', 'SCORE_CHECKPOINT', 'PROTOCOL'):
+            if config.MODEL.KERNEL_SEARCH[key]:
+                config.MODEL.KERNEL_SEARCH[key] = resolve_path(config.MODEL.KERNEL_SEARCH[key])
+        config.MODEL.INIT_CHECKPOINT = resolve_path(config.MODEL.INIT_CHECKPOINT)
+        config.DATA.DATA_PATH = resolve_path(config.DATA.DATA_PATH)
+        config.freeze()
+    validate_config(config)
 
     return config

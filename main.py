@@ -160,8 +160,15 @@ def parse_option():
 
 
 def main(config):
-    dataset_train, dataset_val, data_loader_train, data_loader_val, mixup_fn = build_loader(
-        config)
+    from kernel_stage_search.protocol import validate_training_entry
+    preparing = validate_training_entry(config, dist.get_world_size() if dist.is_initialized() else 1)
+    allow_task_validation = not preparing
+    if preparing:
+        from kernel_stage_search.data import build_prepare_train_loader
+        dataset_train, dataset_val, data_loader_train, data_loader_val, mixup_fn = build_prepare_train_loader(config)
+    else:
+        dataset_train, dataset_val, data_loader_train, data_loader_val, mixup_fn = build_loader(config)
+    training_end = min(config.TRAIN.EPOCHS, config.MODEL.KERNEL_SEARCH.PREPARE_EPOCHS) if preparing else config.TRAIN.EPOCHS
 
     logger.info(f"Creating model:{config.MODEL.TYPE}/{config.MODEL.NAME}")
     teacher = None
@@ -282,9 +289,9 @@ def main(config):
                 resume_load_info.get("restored_train_state", False),
             )
 
-        if config.EVAL_MODE or not config.SKIP_INITIAL_EVAL:
+        if allow_task_validation and (config.EVAL_MODE or not config.SKIP_INITIAL_EVAL):
             validate(config, data_loader_val, model, 0)
-        if config.EVAL_MODE:
+        if allow_task_validation and config.EVAL_MODE:
             return
 
     if config.MODEL.RESUME_BACKBONE:
@@ -294,21 +301,23 @@ def main(config):
             validate(config, data_loader_val, model, 0)
             return
 
-    if config.MODEL.INIT_CHECKPOINT and not config.MODEL.RESUME and not config.SKIP_INITIAL_EVAL and not config.EVAL_MODE:
+    if allow_task_validation and config.MODEL.INIT_CHECKPOINT and not config.MODEL.RESUME and not config.SKIP_INITIAL_EVAL and not config.EVAL_MODE:
         validate(config, data_loader_val, model, 0)
 
-    if config.EVAL_MODE:
+    if allow_task_validation and config.EVAL_MODE:
         validate(config, data_loader_val, model, 0)
         return
 
     if teacher is not None:
+        if preparing:
+            raise ValueError("Teacher training is outside the BBBB preparation protocol")
         print("loading teacher.......")
         load_checkpoint(config, teacher, optimizer, lr_scheduler,
                         loss_scaler, logger, quiet=True)
 
     if config.MODEL.PRETRAINED and not config.MODEL.RESUME and not config.MODEL.INIT_CHECKPOINT:
         load_pretrained(config, model_without_ddp, logger)
-        if not config.SKIP_INITIAL_EVAL:
+        if allow_task_validation and not config.SKIP_INITIAL_EVAL:
             acc1, _, _ = validate(config, data_loader_val, model, 0)
 
     if config.THROUGHPUT_MODE:
@@ -342,7 +351,7 @@ def main(config):
     total_cr_count = 0.0
 
     epoch = config.TRAIN.START_EPOCH
-    for epoch in range(config.TRAIN.START_EPOCH, config.TRAIN.EPOCHS):
+    for epoch in range(config.TRAIN.START_EPOCH, training_end):
         if not config.MTL:
             data_loader_train.sampler.set_epoch(epoch)
 
@@ -366,11 +375,11 @@ def main(config):
             total_cr_count += epoch_cr_count
             if record_cr_values and epoch_cr_records:
                 all_batch_cr_records.extend(epoch_cr_records)
-        if dist.get_rank() == 0 and (epoch % config.SAVE_FREQ == 0 or epoch == (config.TRAIN.EPOCHS - 1)):
+        if dist.get_rank() == 0 and (epoch % config.SAVE_FREQ == 0 or epoch == (training_end - 1)):
             save_checkpoint(config, epoch, model_without_ddp, max_accuracy, optimizer, lr_scheduler, loss_scaler,
                             logger,
                             extra_state={'constrained_mtl': constraint_controller.state_dict()} if constraint_controller is not None else None)
-        if epoch % config.EVAL_FREQ == 0 or (not args.no_eval_50 and epoch == 50):
+        if allow_task_validation and (epoch % config.EVAL_FREQ == 0 or (not args.no_eval_50 and epoch == 50)):
             if config.MTL:
                 validate(config, data_loader_val, model, epoch)
             else:
@@ -399,8 +408,23 @@ def main(config):
             logger.info(f"Conflict gradient ratio metrics saved to {cr_output_path}")
 
     # final eval
-    validate(config, data_loader_val, model, epoch)
+    if allow_task_validation:
+        endpoint_results = validate(config, data_loader_val, model, epoch)
+        if (epoch == 299 and config.TRAIN.EPOCHS == 300 and config.MODEL.STAGE_ABLATION.ENABLED
+                and list(config.TASKS) == ['semseg', 'normals', 'sal', 'human_parts'] and dist.get_rank() == 0):
+            from kernel_stage_search.reporting import write_formal_endpoint
+            write_formal_endpoint(config, epoch, os.path.join(config.OUTPUT, 'ckpt_epoch_299.pth'), endpoint_results)
     total_time = time.perf_counter() - start_time
+    if (config.MODEL.STAGE_ABLATION.ENABLED and dist.get_rank() == 0
+            and (preparing or (config.TRAIN.EPOCHS == 300
+                              and list(config.TASKS) == ['semseg', 'normals', 'sal', 'human_parts']))):
+        from kernel_stage_search.protocol import write_json
+        write_json(os.path.join(config.OUTPUT, 'preparation_cost.json' if preparing else 'training_cost.json'), {
+            'phase': 'prepare' if preparing else 'formal', 'start_epoch': config.TRAIN.START_EPOCH,
+            'completed_epoch': min(epoch, training_end - 1), 'scheduler_horizon': config.TRAIN.EPOCHS,
+            'session_train_and_validation_seconds': total_time,
+            'scope': 'this invocation only; add earlier resume session costs separately',
+        })
     total_time_str = str(datetime.timedelta(seconds=int(total_time)))
     logger.info('Training time {}'.format(total_time_str))
 
@@ -976,6 +1000,9 @@ def throughput(data_loader, model, logger):
 
 if __name__ == '__main__':
     args, config = parse_option()
+
+    from kernel_stage_search.protocol import validate_training_entry
+    validate_training_entry(config, int(os.environ.get('WORLD_SIZE', '1')))
 
     # Enforce float32 matmul precision and disable TF32 for reproducible/strict precision behavior.
     torch.set_float32_matmul_precision("highest")
